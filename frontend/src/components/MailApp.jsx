@@ -6,6 +6,7 @@ import { useWebSocket } from '../hooks/useWebSocket.js';
 import { useMobile } from '../hooks/useMobile.js';
 import { LAYOUTS } from '../layouts.js';
 import { updateFaviconBadge } from '../themes.js';
+import { installResumeRefresh } from '../utils/resumeRefresh.js';
 import { shortcutBus } from '../utils/shortcutBus.js';
 import { setPending, pendingMarkReadMap, completedMarkReadMap } from '../utils/pendingReads.js';
 import { buildKeyMap, buildModKeyMap, getEffectiveShortcuts, getGroupedActions, parseModKey, modLabel, SPECIAL_KEYS, SPECIAL_KEY_LABELS } from '../utils/defaultShortcuts.js';
@@ -14,7 +15,7 @@ import MessageList from './MessageList.jsx';
 import MessagePane from './MessagePane.jsx';
 import NotificationToasts from './NotificationToasts.jsx';
 import CommandPalette from './CommandPalette.jsx';
-import { usePluginSlot, PluginRuntime } from '../plugins/PluginSlot.jsx';
+import { usePluginSlot, PluginRuntime, PluginSlot } from '../plugins/PluginSlot.jsx';
 
 const ContactsPage = lazy(() => import('./ContactsPage.jsx'));
 const WindowLayer  = lazy(() => import('./WindowLayer.jsx'));
@@ -67,7 +68,7 @@ export default function MailApp() {
     mobileSidebarOpen, setMobileSidebarOpen, addNotification,
     fontSize, showAppBadge, showFaviconBadge,
     sidebarWidth, setSidebarWidth, setIsSidebarResizing,
-    showContacts, setTodoistConnected,
+    showContacts, activePluginView, setTodoistConnected,
     accounts, rightSidebarWidth, setRightSidebarWidth, isRightSidebarResizing, setIsRightSidebarResizing,
     rightSidebarHidden, toggleRightSidebarHidden,
   } = useStore();
@@ -438,21 +439,40 @@ export default function MailApp() {
         .then(setUnreadCounts)
         .catch(console.error);
     };
-    refreshCounts();
-    // Also expire stale indicators when the socket is unavailable.
-    const interval = setInterval(() => {
-      refreshCounts();
+    const refreshFolders = () => {
       const state = useStore.getState();
       for (const accountId of Object.keys(state.folders)) {
         api.getFolders(accountId).then(f => useStore.getState().setFolders(accountId, f)).catch(() => {});
       }
-    }, 60000);
+    };
+    refreshCounts();
+    // Also expire stale indicators when the socket is unavailable.
+    const interval = setInterval(() => { refreshCounts(); refreshFolders(); }, 60000);
+
+    // Resynchronise the moment the tab comes back, rather than waiting for a timer that was
+    // frozen while it was away. Without this the LIST can show a pre-sleep snapshot while the
+    // counts, which are polled and pushed from more places, are already current — so the badge
+    // says 2 and the list shows nothing unread, which reads as the unread count lying.
+    //
+    // This deliberately reuses mailflow:refresh, the signal the socket-down fallback already
+    // dispatches and MessageList already listens for, instead of adding a second reload path.
+    // What counts as a resume, and collapsing the burst of signals one resume produces, lives
+    // in utils/resumeRefresh.js with its tests.
+    const stopResume = installResumeRefresh({
+      doc: document, win: window,
+      shouldSkip: () => useStore.getState().isLocked,
+      onResync: () => {
+        refreshCounts();
+        refreshFolders();
+        window.dispatchEvent(new CustomEvent('mailflow:refresh'));
+      },
+    });
+
     window.addEventListener('mailflow:counts_refresh', refreshCounts);
-    window.addEventListener('online', refreshCounts);
     return () => {
       clearInterval(interval);
+      stopResume();
       window.removeEventListener('mailflow:counts_refresh', refreshCounts);
-      window.removeEventListener('online', refreshCounts);
     };
   }, [setAccounts, setUnreadCounts, setTodoistConnected]);
 
@@ -758,10 +778,13 @@ export default function MailApp() {
           <div style={{ flex: 1, overflow: 'hidden', height: '100%', display: showContacts ? 'flex' : 'none' }}>
             <Suspense fallback={lazyFallback}><ContactsPage /></Suspense>
           </div>
-          <div style={{ flex: 1, display: !showContacts && !selectedMessageId ? 'flex' : 'none', overflow: 'hidden', height: '100%' }}>
+          <div style={{ flex: 1, overflow: 'hidden', height: '100%', display: activePluginView ? 'flex' : 'none' }}>
+            <PluginSlot name="main-view" ctx={{ viewId: activePluginView }} />
+          </div>
+          <div style={{ flex: 1, display: !showContacts && !activePluginView && !selectedMessageId ? 'flex' : 'none', overflow: 'hidden', height: '100%' }}>
             <MessageList />
           </div>
-          <div style={{ flex: 1, display: !showContacts && selectedMessageId ? 'flex' : 'none', overflow: 'hidden', height: '100%' }}>
+          <div style={{ flex: 1, display: !showContacts && !activePluginView && selectedMessageId ? 'flex' : 'none', overflow: 'hidden', height: '100%' }}>
             <MessagePane />
           </div>
         </>
@@ -790,7 +813,10 @@ export default function MailApp() {
             <div style={{ display: showContacts ? 'flex' : 'none', flex: 1, minWidth: 0, overflow: 'hidden', height: '100%' }}>
               <Suspense fallback={lazyFallback}><ContactsPage /></Suspense>
             </div>
-            <div style={{ display: showContacts ? 'none' : 'flex', flex: 1, minWidth: 0, overflow: 'hidden', height: '100%', flexDirection: currentLayout.direction }}>
+            <div style={{ display: activePluginView ? 'flex' : 'none', flex: 1, minWidth: 0, overflow: 'hidden', height: '100%' }}>
+              <PluginSlot name="main-view" ctx={{ viewId: activePluginView }} />
+            </div>
+            <div style={{ display: !showContacts && !activePluginView ? 'flex' : 'none', flex: 1, minWidth: 0, overflow: 'hidden', height: '100%', flexDirection: currentLayout.direction }}>
               <MessageList />
               {currentLayout.direction === 'row' && (
                 <div
