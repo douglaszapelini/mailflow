@@ -37,20 +37,20 @@ export function SocialBlock({ block, onChange }) {
               style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--red)', fontSize: 16, padding: '0 2px', flexShrink: 0, lineHeight: 1 }}
             >×</button>
           </div>
-          <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+          <div style={{ display: 'flex', gap: 6 }}>
             <input
               type="url"
               placeholder="https://…"
               value={item.href ?? ''}
               onChange={e => updateItem(idx, 'href', e.target.value)}
-              style={{ ...inputStyle, flex: '1 1 180px', minWidth: 0, fontSize: 12 }}
+              style={{ ...inputStyle, flex: 1, fontSize: 12 }}
             />
             <input
               type="text"
               placeholder="Label (optional)"
               value={item.label ?? ''}
               onChange={e => updateItem(idx, 'label', e.target.value)}
-              style={{ ...inputStyle, flex: '1 1 110px', minWidth: 0, fontSize: 12 }}
+              style={{ ...inputStyle, width: 120, fontSize: 12, flexShrink: 0 }}
             />
           </div>
         </div>

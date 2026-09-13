@@ -17,9 +17,9 @@ export function ColumnsBlock({ block, onChange }) {
 
   return (
     <div style={{ padding: '4px 0' }}>
-      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+      <div style={{ display: 'flex', gap: 8 }}>
         {cols.map((col, idx) => (
-          <div key={idx} style={{ flex: '1 1 130px', minWidth: 0 }}>
+          <div key={idx} style={{ flex: 1, minWidth: 0 }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
               <span style={{ fontSize: 11, color: 'var(--text-tertiary)' }}>Col {idx + 1}</span>
               {cols.length > 2 && (

@@ -1,11 +1,8 @@
-import { useState } from 'react';
 import DOMPurify from 'dompurify';
 import { useTemplateManager } from './useTemplateManager.js';
 import { TemplateEditor } from './TemplateEditor.jsx';
 import { blocksToEditorHtml } from './blocksToEditorHtml.js';
 import { inputStyle, btnPrimary, btnSecondary, labelStyle } from './styles.js';
-import { useMobile } from '../../hooks/useMobile.js';
-import { useStore } from '../../store/index.js';
 
 const DOMPURIFY_CONFIG = {
   ADD_TAGS: ['svg', 'path', 'circle', 'line', 'rect', 'polyline', 'polygon', 'ellipse'],
@@ -25,55 +22,29 @@ export function TemplateBuilderPage() {
     previewHtml,
   } = useTemplateManager();
 
-  const isMobile = useMobile();
-  const setActivePluginView = useStore(s => s.setActivePluginView);
-  const [mobilePanel, setMobilePanel] = useState('list');
-
-  const handleSelectTemplate = (tpl) => {
-    selectTemplate(tpl);
-    if (isMobile) setMobilePanel('detail');
-  };
-
-  const handleStartCreate = () => {
-    startCreate();
-    if (isMobile) setMobilePanel('detail');
-  };
-
-  const handleGoBackToList = () => {
-    setMobilePanel('list');
-    cancelEdit();
-  };
-
-  const handleConfirmDelete = async () => {
-    await confirmDelete();
-    if (isMobile) setMobilePanel('list');
-  };
-
   const listPanel = (
     <div style={{
-      width: isMobile ? '100%' : 280, flexShrink: 0, display: 'flex', flexDirection: 'column',
-      borderRight: isMobile ? 'none' : '1px solid var(--border)',
+      width: 260, flexShrink: 0, display: 'flex', flexDirection: 'column',
+      borderRight: '1px solid var(--border)',
       background: 'var(--bg-secondary)',
-      overflow: 'hidden', flex: isMobile ? 1 : 'none',
+      overflow: 'hidden',
     }}>
-      {!isMobile && (
-        <div style={{ padding: '14px 14px 12px', borderBottom: '1px solid var(--border-subtle)', flexShrink: 0 }}>
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-            <span style={{ fontSize: 14, fontWeight: 600, color: 'var(--text-primary)' }}>Templates</span>
-            <button
-              type="button"
-              onClick={handleStartCreate}
-              style={{
-                background: 'var(--accent)', border: 'none', borderRadius: 6,
-                color: '#fff', fontSize: 12, fontWeight: 500,
-                padding: '4px 10px', cursor: 'pointer',
-              }}
-            >
-              + New
-            </button>
-          </div>
+      <div style={{ padding: '14px 14px 12px', borderBottom: '1px solid var(--border-subtle)', flexShrink: 0 }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+          <span style={{ fontSize: 14, fontWeight: 600, color: 'var(--text-primary)' }}>Templates</span>
+          <button
+            type="button"
+            onClick={startCreate}
+            style={{
+              background: 'var(--accent)', border: 'none', borderRadius: 6,
+              color: '#fff', fontSize: 12, fontWeight: 500,
+              padding: '4px 10px', cursor: 'pointer',
+            }}
+          >
+            + New
+          </button>
         </div>
-      )}
+      </div>
 
       <div style={{ flex: 1, overflowY: 'auto' }}>
         {loading && !templates.length && (
@@ -90,7 +61,7 @@ export function TemplateBuilderPage() {
           <button
             key={tpl.id}
             type="button"
-            onClick={() => handleSelectTemplate(tpl)}
+            onClick={() => selectTemplate(tpl)}
             style={{
               display: 'block', width: '100%', textAlign: 'left',
               padding: '10px 14px', cursor: 'pointer',
@@ -125,7 +96,7 @@ export function TemplateBuilderPage() {
 
   const detailPanel = (
     <>
-      {!selected && !showNew && !isMobile && (
+      {!selected && !showNew && (
         <div style={{
           display: 'flex', flexDirection: 'column',
           alignItems: 'center', justifyContent: 'center',
@@ -143,7 +114,7 @@ export function TemplateBuilderPage() {
           </div>
           <button
             type="button"
-            onClick={handleStartCreate}
+            onClick={startCreate}
             style={{
               marginTop: 4, background: 'var(--accent)', border: 'none', borderRadius: 7,
               color: '#fff', fontSize: 13, fontWeight: 500,
@@ -162,7 +133,7 @@ export function TemplateBuilderPage() {
           {pendingDelete && (
             <DeleteConfirm
               name={pendingDelete.name}
-              onConfirm={handleConfirmDelete}
+              onConfirm={confirmDelete}
               onCancel={cancelDelete}
             />
           )}
@@ -222,12 +193,12 @@ export function TemplateBuilderPage() {
             </label>
           </div>
 
-          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 24, minHeight: 300 }}>
-            <div style={{ flex: '1 1 280px', minWidth: 0 }}>
+          <div style={{ display: 'flex', gap: 24, minHeight: 300 }}>
+            <div style={{ flex: 1, minWidth: 0 }}>
               <div style={{ fontSize: 13, fontWeight: 500, color: 'var(--text-primary)', marginBottom: 10 }}>Blocks</div>
               <TemplateEditor blocks={form.blocks} onChange={blocks => setForm(f => ({ ...f, blocks }))} />
             </div>
-            <div style={{ flex: '1 1 280px', minWidth: 0, borderLeft: isMobile ? 'none' : '1px solid var(--border)', borderTop: isMobile ? '1px solid var(--border)' : 'none', paddingLeft: isMobile ? 0 : 24, paddingTop: isMobile ? 24 : 0 }}>
+            <div style={{ flex: 1, minWidth: 0, borderLeft: '1px solid var(--border)', paddingLeft: 24 }}>
               <div style={{ fontSize: 13, fontWeight: 500, color: 'var(--text-primary)', marginBottom: 10 }}>Preview</div>
               <TiptapPreview html={previewHtml} />
             </div>
@@ -242,7 +213,7 @@ export function TemplateBuilderPage() {
             >
               {saving ? 'Saving…' : 'Save template'}
             </button>
-            <button type="button" onClick={isMobile ? handleGoBackToList : cancelEdit} disabled={saving} style={btnSecondary}>
+            <button type="button" onClick={cancelEdit} disabled={saving} style={btnSecondary}>
               Cancel
             </button>
           </div>
@@ -250,74 +221,6 @@ export function TemplateBuilderPage() {
       )}
     </>
   );
-
-  if (isMobile) {
-    const mobileTitle = (mobilePanel === 'detail' && selected && !showNew)
-      ? selected.name
-      : (showNew ? 'New template' : 'Templates');
-
-    return (
-      <div style={{ display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden', background: 'var(--bg-secondary)' }}>
-        <div style={{
-          display: 'flex', alignItems: 'center', gap: 4,
-          paddingTop: 'calc(var(--sat) + 10px)',
-          paddingBottom: 10, paddingLeft: 12, paddingRight: 12,
-          borderBottom: '1px solid var(--border-subtle)',
-          background: 'var(--bg-secondary)', flexShrink: 0,
-        }}>
-          <button
-            type="button"
-            onClick={mobilePanel === 'detail' ? handleGoBackToList : () => setActivePluginView(null)}
-            style={{
-              background: 'none', border: 'none', color: 'var(--text-secondary)',
-              cursor: 'pointer', padding: 0, borderRadius: 7,
-              display: 'flex', alignItems: 'center', justifyContent: 'center',
-              minWidth: 44, minHeight: 44,
-            }}
-          >
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <polyline points="15 18 9 12 15 6"/>
-            </svg>
-          </button>
-
-          <h2 style={{
-            flex: 1, margin: 0, fontSize: 16, fontWeight: 600,
-            color: 'var(--text-primary)',
-            overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
-          }}>
-            {mobileTitle}
-          </h2>
-
-          {mobilePanel === 'list' && (
-            <button
-              type="button"
-              onClick={handleStartCreate}
-              style={{
-                background: 'none', border: 'none', color: 'var(--accent)',
-                cursor: 'pointer', padding: 0,
-                display: 'flex', alignItems: 'center', justifyContent: 'center',
-                minWidth: 44, minHeight: 44,
-              }}
-            >
-              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
-              </svg>
-            </button>
-          )}
-        </div>
-
-        {mobilePanel === 'list' ? (
-          <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden', animation: 'slide-in-left var(--motion-normal) var(--ease-emphasized) both' }}>
-            {listPanel}
-          </div>
-        ) : (
-          <div style={{ flex: 1, overflow: 'hidden auto', padding: '16px 14px', animation: 'slide-in-right var(--motion-normal) var(--ease-emphasized) both' }}>
-            {detailPanel}
-          </div>
-        )}
-      </div>
-    );
-  }
 
   return (
     <div style={{ display: 'flex', flex: 1, minWidth: 0, height: '100%', overflow: 'hidden', background: 'var(--bg-primary)' }}>

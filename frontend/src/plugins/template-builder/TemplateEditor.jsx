@@ -151,7 +151,7 @@ export function TemplateEditor({ blocks, onChange }) {
             borderBottom: expandedId === block.id ? '1px solid var(--border)' : 'none',
           }}>
             <span
-              style={{ flex: 1, minWidth: 0, fontSize: 13, fontWeight: 500, color: 'var(--text-primary)', cursor: 'pointer', userSelect: 'none', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+              style={{ flex: 1, fontSize: 13, fontWeight: 500, color: 'var(--text-primary)', cursor: 'pointer', userSelect: 'none' }}
               onClick={() => setExpandedId(expandedId === block.id ? null : block.id)}
             >
               {getBlockLabel(block)}
