@@ -303,18 +303,84 @@ export function decodeMimeWords(str) {
   } while (s !== prev);
   return s.replace(/=\?([^?]+)\?([BQbq])\?([^?]*)\?=/g, (match, charset, enc, text) => {
     try {
-      if (enc.toUpperCase() === 'Q') {
-        const bytes = text.replace(/_/g, ' ').replace(/=([0-9A-Fa-f]{2})/g, (_, h) => String.fromCharCode(parseInt(h, 16)));
-        return Buffer.from(bytes, 'binary').toString('utf8');
-      }
-      return Buffer.from(text, 'base64').toString('utf8');
+      const bytes = enc.toUpperCase() === 'Q'
+        ? Buffer.from(
+          text.replace(/_/g, ' ').replace(/=([0-9A-Fa-f]{2})/g, (_, h) => String.fromCharCode(parseInt(h, 16))),
+          'binary',
+        )
+        : Buffer.from(text, 'base64');
+      // An encoded-word's charset may carry a language tag: =?utf-8*en?Q?...?= (RFC 2231 §5).
+      return decodeEncodedWordBytes(bytes, String(charset).split('*')[0]);
     } catch { return match; }
   });
 }
 
+// An RFC 2047 encoded-word names its own charset, and that charset is frequently not UTF-8:
+// ISO-8859-1 and windows-1252 are still common from older mailers, and Scandinavian and
+// Central European senders hit them constantly. Decoding those bytes as UTF-8 turns every
+// non-ASCII character into U+FFFD, which is what #454 reported.
+function decodeEncodedWordBytes(bytes, charset) {
+  const label = String(charset || '').trim().toLowerCase() || 'utf-8';
+  try {
+    return new TextDecoder(label).decode(bytes);
+  } catch {
+    // An unknown or bogus label (x-unknown, unknown-8bit, a plain typo). Same policy as raw
+    // header bytes: prefer UTF-8, fall back to windows-1252 only when UTF-8 comes back
+    // damaged, so this degrades to wrong-but-readable rather than to U+FFFD.
+    return decodeBytesPreferUtf8(bytes);
+  }
+}
+
+// Reused rather than constructed per call: parseRawHeaders runs for every message during
+// sync, and decodeHeaderBytes calls this once per header line. decode() is stateless when
+// not streaming, so sharing an instance is safe.
+const UTF8_DECODER = new TextDecoder('utf-8'); // utf-8 exists in every Node build
+// windows-1252 needs ICU. Node ships full ICU by default and the runtime image has it, but
+// this is self-hosted software and a small-icu build must not fail to boot over a fallback
+// decoder, so its absence is tolerated and simply disables the fallback.
+const WINDOWS_1252_DECODER = (() => {
+  try {
+    return new TextDecoder('windows-1252');
+  } catch {
+    return null;
+  }
+})();
+const REPLACEMENT_CHAR = '\uFFFD';
+
+// Prefer UTF-8, and only reinterpret as windows-1252 when UTF-8 comes back damaged. Every
+// byte is representable in windows-1252, so this degrades to wrong-but-readable rather than
+// to a row of U+FFFD.
+function decodeBytesPreferUtf8(bytes) {
+  const utf8 = UTF8_DECODER.decode(bytes);
+  if (!utf8.includes(REPLACEMENT_CHAR) || !WINDOWS_1252_DECODER) return utf8;
+  return WINDOWS_1252_DECODER.decode(bytes);
+}
+
+// Header bytes are meant to be ASCII, with anything else carried in RFC 2047 encoded-words.
+// Plenty of senders ignore that and put raw 8-bit bytes in a Subject or a display name.
+// Decoding those as UTF-8 destroys them before encoded-word decoding ever runs, producing
+// the same replacement characters as #454 by a different route.
+//
+// The choice is made per line rather than per block. Applying it to the whole block let one
+// sender's stray 8-bit byte decide how every other header was read, so a block holding a
+// genuinely UTF-8 subject alongside one latin1 display name turned that subject into
+// mojibake: a worse result than the single replacement character it replaced. A UTF-8
+// sequence never contains 0x0A, so splitting on it cannot cut one in half.
+function decodeHeaderBytes(buf) {
+  const out = [];
+  let start = 0;
+  for (let i = 0; i <= buf.length; i++) {
+    if (i !== buf.length && buf[i] !== 0x0A) continue;
+    out.push(decodeBytesPreferUtf8(buf.subarray(start, i)));
+    if (i < buf.length) out.push('\n');
+    start = i + 1;
+  }
+  return out.join('');
+}
+
 export function parseRawHeaders(buf) {
   if (!buf) return {};
-  const text = Buffer.isBuffer(buf) ? buf.toString('utf8') : String(buf);
+  const text = Buffer.isBuffer(buf) ? decodeHeaderBytes(buf) : String(buf);
   const result = {};
   // Headers can be folded (continuation lines start with whitespace)
   const unfolded = text.replace(/\r\n([ \t])/g, ' ').replace(/\n([ \t])/g, ' ');
@@ -355,7 +421,7 @@ export function parseHeadersInput(headers) {
 
 export function headersToRawString(headers) {
   if (!headers) return '';
-  if (Buffer.isBuffer(headers)) return headers.toString('utf8');
+  if (Buffer.isBuffer(headers)) return decodeHeaderBytes(headers);
   const parsed = parseHeadersInput(headers);
   if (Object.keys(parsed).length) {
     return Object.entries(parsed)
@@ -673,11 +739,231 @@ export async function parseMessage(msg) {
   };
 }
 
-function detectAttachments(structure) {
+// Mirrors walkStructure's classification (imapManager.js) so the paperclip flag
+// agrees with the attachment list: an explicit attachment disposition anywhere,
+// or a text part carrying a filename alongside an unnamed text part serving as
+// the body (an inline .html report or .txt log the sender didn't dispose as an
+// attachment). Exported for tests.
+export function detectAttachments(structure) {
   if (!structure) return false;
-  if (structure.disposition === 'attachment') return true;
-  if (structure.childNodes) {
-    return structure.childNodes.some(child => detectAttachments(child));
+  let explicit = false;
+  let namedText = 0;
+  let unnamedText = 0;
+  const visit = (node) => {
+    if (!node) return;
+    if (node.disposition === 'attachment') { explicit = true; return; }
+    if (node.childNodes?.length) { node.childNodes.forEach(visit); return; }
+    const type = (node.type || '').toLowerCase();
+    if (type === 'text/plain' || type === 'text/html' || type === 'application/xhtml+xml') {
+      if (node.dispositionParameters?.filename || node.parameters?.name) namedText += 1;
+      else unnamedText += 1;
+    }
+  };
+  visit(structure);
+  return explicit || (namedText > 0 && unnamedText > 0);
+}
+
+// ── Calendar invite rendering ────────────────────────────────────────────────
+// Outlook "forward meeting" emails are often a single text/calendar part with
+// no text/html or text/plain alternative, which used to render as raw
+// VCALENDAR source. Renders a readable invite instead: a summary card
+// (what/when/where/organizer) followed by the event description, preferring
+// Outlook's X-ALT-DESC HTML form of the description when present. The
+// returned html goes through the same sanitizer as any email HTML.
+
+// RFC 5545 line unfolding: a line starting with space or tab continues the
+// previous line (the leading whitespace char itself is discarded).
+function unfoldIcsLines(raw) {
+  const lines = [];
+  for (const line of String(raw || '').split(/\r?\n/)) {
+    if ((line.startsWith(' ') || line.startsWith('\t')) && lines.length) {
+      lines[lines.length - 1] += line.slice(1);
+    } else {
+      lines.push(line);
+    }
   }
-  return false;
+  return lines;
+}
+
+// Splits a content line into name, parameters and value. Parameter values may
+// be quoted and contain ':' or ';' (TZID="(UTC-05:00) Eastern Time"), so only
+// separators outside quotes count. Returns null for a line with no value.
+function parseIcsLine(line) {
+  const segments = [];
+  let from = 0;
+  let inQuote = false;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (c === '"') { inQuote = !inQuote; continue; }
+    if (inQuote || (c !== ';' && c !== ':')) continue;
+    segments.push(line.slice(from, i));
+    from = i + 1;
+    if (c === ':') {
+      const [name, ...paramParts] = segments;
+      const params = {};
+      for (const p of paramParts) {
+        const eq = p.indexOf('=');
+        if (eq > 0) params[p.slice(0, eq).trim().toUpperCase()] = p.slice(eq + 1).replace(/^"|"$/g, '');
+      }
+      return { name: name.trim().toUpperCase(), params, value: line.slice(from) };
+    }
+  }
+  return null;
+}
+
+// RFC 5545 TEXT unescaping in a single pass: \n or \N is a line break and \\ \;
+// \, are the literal character, so an escaped backslash before "n" stays "\n".
+function unescapeIcsText(value) {
+  return String(value || '').replace(/\\([nN\\;,])/g, (_, c) => (c === 'n' || c === 'N' ? '\n' : c));
+}
+
+function escapeHtml(s) {
+  return String(s || '')
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+const ICS_DT_RE = /^(\d{4})(\d{2})(\d{2})(?:T(\d{2})(\d{2}))?/;
+
+function formatIcsTime(h, m) {
+  const hour12 = h % 12 === 0 ? 12 : h % 12;
+  return `${hour12}:${String(m).padStart(2, '0')} ${h < 12 ? 'AM' : 'PM'}`;
+}
+
+// "20260901T140000" → "Tuesday, September 1, 2026, 2:00 PM". The wall-clock
+// value is shown as-is (the TZID param is appended by the caller); a trailing
+// Z is labeled UTC. Date-only values render without a time.
+function formatIcsDate(value) {
+  const m = ICS_DT_RE.exec(value || '');
+  if (!m) return value || '';
+  const [, y, mo, d, hh, mm] = m;
+  const day = new Date(Date.UTC(Number(y), Number(mo) - 1, Number(d)));
+  const datePart = day.toLocaleDateString('en-US', {
+    weekday: 'long', year: 'numeric', month: 'long', day: 'numeric', timeZone: 'UTC',
+  });
+  if (hh === undefined) return datePart;
+  return `${datePart}, ${formatIcsTime(Number(hh), Number(mm))}${/Z$/i.test(value) ? ' UTC' : ''}`;
+}
+
+// The day before a date-only value ("20260902" → "20260901").
+function previousIcsDay(value) {
+  const m = ICS_DT_RE.exec(value || '');
+  if (!m) return value || '';
+  const day = new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]) - 1));
+  return day.toISOString().slice(0, 10).replace(/-/g, '');
+}
+
+const ICS_METHOD_LABELS = {
+  REQUEST: 'Meeting invitation',
+  CANCEL: 'Meeting cancelled',
+  REPLY: 'Meeting response',
+};
+
+// Parses the first VEVENT of an iCalendar text and renders { html, text },
+// or null when the input is not a usable VCALENDAR.
+export function renderCalendarInvite(ics) {
+  if (!/BEGIN:VCALENDAR/i.test(ics || '')) return null;
+
+  const props = Object.create(null);
+  let method = '';
+  let inEvent = false;
+  let eventDone = false;
+  let nested = 0; // depth of sub-components (VALARM) inside the VEVENT
+  for (const line of unfoldIcsLines(ics)) {
+    const prop = parseIcsLine(line);
+    if (!prop) continue;
+    const { name, params, value } = prop;
+    if (name === 'BEGIN' || name === 'END') {
+      const component = value.trim().toUpperCase();
+      if (component === 'VEVENT') {
+        if (name === 'BEGIN') {
+          if (eventDone) break;
+          inEvent = true;
+        } else if (inEvent) {
+          inEvent = false;
+          eventDone = true;
+        }
+        nested = 0;
+      } else if (inEvent) {
+        nested = Math.max(0, nested + (name === 'BEGIN' ? 1 : -1));
+      }
+      continue;
+    }
+    if (!inEvent) {
+      if (name === 'METHOD' && !method) method = value.trim().toUpperCase();
+      continue;
+    }
+    // A VALARM's properties are not the event's (its DESCRIPTION is usually
+    // just "REMINDER"); within the event itself the first occurrence wins.
+    if (nested > 0 || name in props) continue;
+    props[name] = { value, params };
+  }
+  if (!eventDone) return null;
+
+  const summary = unescapeIcsText(props.SUMMARY?.value || '').trim();
+  const location = unescapeIcsText(props.LOCATION?.value || '').trim();
+  const organizerName = unescapeIcsText(props.ORGANIZER?.params?.CN || '').trim();
+  const organizerMail = (props.ORGANIZER?.value || '').replace(/^mailto:/i, '').trim();
+  const organizer = organizerName
+    ? organizerMail ? `${organizerName} <${organizerMail}>` : organizerName
+    : organizerMail;
+
+  let when = '';
+  const start = props.DTSTART;
+  const end = props.DTEND;
+  if (start?.value) {
+    when = formatIcsDate(start.value);
+    const startDt = ICS_DT_RE.exec(start.value);
+    const endDt = ICS_DT_RE.exec(end?.value || '');
+    if (startDt && endDt && startDt[4] === undefined && endDt[4] === undefined) {
+      // All-day events: a date-only DTEND is exclusive, so show through the
+      // day before it, and give a one-day event a single date.
+      const lastDay = previousIcsDay(end.value);
+      if (lastDay > start.value.slice(0, 8)) when += ` – ${formatIcsDate(lastDay)}`;
+    } else if (end?.value) {
+      const sameDay = start.value.slice(0, 8) === end.value.slice(0, 8);
+      when += sameDay && endDt?.[4] !== undefined
+        ? ` – ${formatIcsTime(Number(endDt[4]), Number(endDt[5]))}`
+        : ` – ${formatIcsDate(end.value)}`;
+    }
+    // Exchange TZIDs can carry their own parentheses: "(UTC-05:00) Eastern Time".
+    const tzid = (start.params?.TZID || '').trim();
+    if (tzid) when += tzid.startsWith('(') ? ` ${tzid}` : ` (${tzid})`;
+  }
+
+  const methodLabel = ICS_METHOD_LABELS[method] || '';
+  const rows = [];
+  if (when) rows.push(['When', when]);
+  if (location) rows.push(['Where', location]);
+  if (organizer) rows.push(['Organizer', organizer]);
+  if (!summary && !rows.length) return null;
+
+  const card =
+    '<div style="border:1px solid #d0d0d0;border-radius:8px;padding:12px 16px;margin:0 0 16px;font-family:sans-serif">'
+    + (methodLabel ? `<div style="font-size:12px;color:#777;margin-bottom:4px">${escapeHtml(methodLabel)}</div>` : '')
+    + (summary ? `<div style="font-size:16px;font-weight:600;margin-bottom:8px">${escapeHtml(summary)}</div>` : '')
+    + rows.map(([k, v]) => `<div style="font-size:13px;margin:2px 0"><b>${k}:</b> ${escapeHtml(v)}</div>`).join('')
+    + '</div>';
+
+  // Outlook ships an HTML form of the description in X-ALT-DESC — prefer it;
+  // otherwise render the plain DESCRIPTION preserving its line breaks.
+  const altDesc = props['X-ALT-DESC'];
+  const altHtml = (altDesc?.params?.FMTTYPE || '').toLowerCase() === 'text/html'
+    ? unescapeIcsText(altDesc.value).trim()
+    : '';
+  const description = unescapeIcsText(props.DESCRIPTION?.value || '').trim();
+  const bodyHtml = altHtml
+    || (description
+      ? `<div style="font-family:sans-serif;font-size:13px;white-space:pre-wrap">${escapeHtml(description)}</div>`
+      : '');
+
+  const text = [
+    methodLabel,
+    summary,
+    ...rows.map(([k, v]) => `${k}: ${v}`),
+    '',
+    description,
+  ].filter(Boolean).join('\n');
+
+  return { html: card + bodyHtml, text };
 }

@@ -3,12 +3,14 @@ import { useTranslation } from 'react-i18next';
 import { useStore } from '../store/index.js';
 import { unreadBadge } from '../utils/unreadBadge.js';
 import { api } from '../utils/api.js';
+import { resolveThreadMessages } from '../utils/threadActions.js';
 import {
   activateOnKey,
   buildFolderTree,
   collapsedTooltip,
   FOLDER_ORDER_DRAG_TYPE,
   folderDropPosition,
+  hasRenderedInbox,
   resolveFolderOrderDrop,
 } from '../utils/sidebar.js';
 import { useMobile } from '../hooks/useMobile.js';
@@ -296,7 +298,7 @@ export default function Sidebar() {
     return () => document.removeEventListener('dragend', clear);
   }, [clearFolderDrag]);
 
-  const handleMsgDrop = useCallback((e, targetFolder) => {
+  const handleMsgDrop = useCallback(async (e, targetFolder) => {
     e.preventDefault();
     setMsgDragTarget(null);
     const raw = e.dataTransfer.getData('application/x-mailflow-message');
@@ -305,28 +307,68 @@ export default function Sidebar() {
     try { payload = JSON.parse(raw); } catch { return; }
     const state = useStore.getState();
     const pool = [...state.messages, ...state.searchResults];
-    const ids = payload.messageIds ?? [payload.messageId];
-    const msgs = ids
-      .map(id => pool.find(m => m.id === id))
-      .filter(m => m != null && m.folder !== targetFolder);
+
+    // `msgs` are the rows the list hides and puts back; `movedIds` are what the server is asked
+    // to move. They are the same thing for ordinary rows and deliberately differ for a thread:
+    // one visible row stands for messages that were never loaded, so the ids come from the
+    // server while the row is the only thing there is to restore.
+    let msgs;
+    let movedIds;
+    if (payload.threadId) {
+      const row = pool.find(m => m.id === payload.messageId);
+      if (!row) return;
+      let threadMsgs;
+      try {
+        // The server decides what a thread contains, never the expansion-time cache — a thread
+        // gains messages while you look at it, and a stale list moves some and strands the rest.
+        // See utils/threadActions.js.
+        threadMsgs = await resolveThreadMessages({
+          message: row,
+          isThreadRow: true,
+          fetchThread: () => api.getThread(payload.threadId, payload.threadFolder, payload.threadUnified),
+        });
+      } catch (err) {
+        console.error('Failed to load thread for move:', err.message);
+        state.addNotification({ title: t('message.moved.failTitle'), body: t('message.moved.failBody') });
+        return;
+      }
+      // A folder path is account-specific, and a thread can span accounts (and always includes
+      // Sent copies), so scope the move to the dragged row's account exactly as the context-menu
+      // move does — the server silently skips messages whose account lacks the destination.
+      movedIds = [...new Set(
+        threadMsgs.filter(m => m?.account_id === row.account_id).map(m => m.id).filter(Boolean)
+      )];
+      if (!movedIds.length) movedIds = [row.id];
+      msgs = [row];
+    } else {
+      const ids = payload.messageIds ?? [payload.messageId];
+      msgs = ids
+        .map(id => pool.find(m => m.id === id))
+        .filter(m => m != null && m.folder !== targetFolder);
+      movedIds = msgs.map(m => m.id);
+    }
     if (!msgs.length) return;
     msgs.forEach(msg => {
       state.removeMessage(msg.id);
       if (!msg.is_read) state.decrementUnread(msg.account_id);
     });
-    const movedIds = msgs.map(m => m.id);
     let undone = false;
     const timer = setTimeout(async () => {
       if (undone) return;
       try {
         const result = await api.bulkMove(movedIds, targetFolder);
         const movedSet = new Set(result.moved ?? []);
-        const failedMsgs = msgs.filter(m => !movedSet.has(m.id));
+        const failedIds = movedIds.filter(id => !movedSet.has(id));
+        // A thread's single row stands for every id in the move, so any failure puts that row
+        // back. Ordinary rows still restore only the ones that actually failed.
+        const failedMsgs = payload.threadId
+          ? (failedIds.length > 0 ? msgs : [])
+          : msgs.filter(m => !movedSet.has(m.id));
         const s = useStore.getState();
         if (failedMsgs.length > 0) {
           s.restoreMessages(failedMsgs);
           failedMsgs.forEach(m => { if (!m.is_read) s.incrementUnread(m.account_id); });
-          s.addNotification({ title: t('messageList.bulkMoved.failTitle'), body: t('messageList.bulkMoved.failBody', { count: failedMsgs.length }) });
+          s.addNotification({ title: t('messageList.bulkMoved.failTitle'), body: t('messageList.bulkMoved.failBody', { count: failedIds.length }) });
         } else {
           s.recordRecentFolder({ accountId: msgs[0].account_id, path: targetFolder });
         }
@@ -703,6 +745,10 @@ export default function Sidebar() {
           setCreatingFolder({ accountId, parentPath: folderObj.path });
           setCreateName('');
           if (!expandedAccounts[accountId]) setExpandedAccounts(prev => ({ ...prev, [accountId]: true }));
+          // Un-collapse the target folder so the input isn't hidden with it.
+          if (collapsedFolders.includes(`${accountId}:${folderObj.path}`)) {
+            toggleCollapsedFolder(accountId, folderObj.path);
+          }
         },
       },
       { separator: true },
@@ -1112,9 +1158,18 @@ export default function Sidebar() {
           const expanded = expandedAccounts[account.id];
           const isSelected = selectedAccountId === account.id;
           const accountFolders = folders[account.id] || [];
+          const accountHiddenPaths = hiddenFolders[account.id] || [];
+          const showingHidden = showHiddenFor.has(account.id);
 
           const selectInbox = () => setSelectedAccount(account.id, 'INBOX');
           const rowLabel = collapsedTooltip(account.email_address, sidebarCollapsed);
+          const hasInbox = hasRenderedInbox(accountFolders, {
+            expanded,
+            sidebarCollapsed,
+            hiddenPaths: accountHiddenPaths,
+            showingHidden,
+          });
+          const isAccountActive = isSelected && selectedFolder === 'INBOX' && !hasInbox;
 
           return (
             <div key={account.id}>
@@ -1125,17 +1180,17 @@ export default function Sidebar() {
                   display: 'flex', alignItems: 'center', gap: 8,
                   padding: sidebarCollapsed ? '8px' : '7px 10px',
                   borderRadius: 7, cursor: 'pointer',
-                  background: isSelected && selectedFolder === 'INBOX'
-                    ? 'var(--bg-hover)' : 'transparent',
+                  background: isAccountActive ? 'var(--bg-hover)' : 'transparent',
                   transition: 'background 0.1s',
                   justifyContent: sidebarCollapsed ? 'center' : 'flex-start',
+                  margin: '1px 0',
                 }}
                 onMouseEnter={e => {
-                  if (!(isSelected && selectedFolder === 'INBOX'))
+                  if (!isAccountActive)
                     e.currentTarget.style.background = 'var(--bg-tertiary)';
                 }}
                 onMouseLeave={e => {
-                  if (!(isSelected && selectedFolder === 'INBOX'))
+                  if (!isAccountActive)
                     e.currentTarget.style.background = 'transparent';
                 }}
                 onClick={selectInbox}
@@ -1229,10 +1284,14 @@ export default function Sidebar() {
 
                 const createFolderInput = (indent) => (
                   <div style={{
+                    pointerEvents: 'auto',
                     display: 'flex', alignItems: 'center', gap: 8,
                     padding: `6px 10px 6px ${indent}px`, borderRadius: 7,
+                    margin: '1px 0',
                   }}>
-                    <span style={{ color: 'var(--text-tertiary)', flexShrink: 0, display: 'flex' }}>{ICONS.folder}</span>
+                    {/* No folder icon here: at deep indents its footprint squeezes
+                        the input to a sliver, and the indent alone already places
+                        the row among its future siblings. */}
                     <input
                       ref={createInputRef}
                       value={createName}
@@ -1255,9 +1314,6 @@ export default function Sidebar() {
                     </div>
                   </div>
                 );
-
-                const accountHiddenPaths = hiddenFolders[account.id] || [];
-                const showingHidden = showHiddenFor.has(account.id);
 
                 const handleFolderOrderDragStart = (event, path) => {
                   event.stopPropagation();
@@ -1333,11 +1389,18 @@ export default function Sidebar() {
                   ) ? folderDropTarget.position : null;
 
                   return (
-                    <div key={folder.path} style={isHidden ? { opacity: 0.45 } : undefined}>
+                    // The wrapper takes no pointer events of its own. Under fractional display
+                    // scaling (a 175% Windows desktop) row boundaries land on fractional pixels,
+                    // and at that seam this element, which has no drag handling, won the hit
+                    // test: a one-frame "cannot drop" while dragging past. Its interactive
+                    // descendants opt back in.
+                    <div key={folder.path} style={{ pointerEvents: 'none', ...(isHidden ? { opacity: 0.45 } : null) }}>
                       <div
                         style={{
+                          pointerEvents: 'auto',
                           display: 'flex', alignItems: 'center', gap: 6,
                           padding: `6px 10px 6px ${indent}px`, borderRadius: 7,
+                          margin: '1px 0',
                           cursor: isRenaming ? 'default' : 'pointer',
                           background: (msgDragTarget === `${account.id}:${folder.path}`) ? 'var(--accent-dim)' : isFolderSelected ? 'var(--bg-hover)' : 'transparent',
                           transition: 'background 0.1s',
@@ -1465,12 +1528,13 @@ export default function Sidebar() {
 
                       {/* Children — shown when expanded */}
                       {hasChildren && isExpanded && (
-                        <>
-                          {visibleChildren.map(child => renderNode(child, depth + 1, visibleChildren))}
-                          {creatingFolder?.accountId === account.id && creatingFolder?.parentPath === folder.path &&
-                            createFolderInput(BASE_INDENT + (depth + 1) * DEPTH_INDENT)}
-                        </>
+                        visibleChildren.map(child => renderNode(child, depth + 1, visibleChildren))
                       )}
+                      {/* Subfolder-create input — outside the children block so it
+                          also renders on leaf folders (gated inside it, "New
+                          subfolder" on a childless folder silently did nothing). */}
+                      {creatingFolder?.accountId === account.id && creatingFolder?.parentPath === folder.path &&
+                        createFolderInput(BASE_INDENT + (depth + 1) * DEPTH_INDENT)}
                     </div>
                   );
                 };
@@ -1480,7 +1544,7 @@ export default function Sidebar() {
                   ? tree
                   : tree.filter(node => !accountHiddenPaths.includes(node.path));
                 return (
-                  <div>
+                  <div style={{ marginTop: 2 }}>
                     {visibleTree.map(node => renderNode(node, 0, visibleTree))}
                     {/* Show/hide hidden folders toggle */}
                     {accountHiddenPaths.length > 0 && (
@@ -1489,6 +1553,7 @@ export default function Sidebar() {
                         style={{
                           display: 'flex', alignItems: 'center', gap: 6,
                           padding: '4px 10px 4px 26px', borderRadius: 7,
+                          margin: '1px 0',
                           background: 'none', border: 'none', cursor: 'pointer',
                           color: showingHidden ? 'var(--accent)' : 'var(--text-tertiary)',
                           fontSize: 11, width: '100%', transition: 'color 0.1s',
@@ -1514,6 +1579,7 @@ export default function Sidebar() {
                           style={{
                             display: 'flex', alignItems: 'center', gap: 8,
                             padding: '5px 10px 5px 26px', borderRadius: 7,
+                            margin: '1px 0',
                             background: 'none', border: 'none', cursor: 'pointer',
                             color: 'var(--text-tertiary)', fontSize: 11, width: '100%',
                             transition: 'color 0.1s',

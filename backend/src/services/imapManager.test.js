@@ -3,7 +3,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 vi.mock('imapflow', () => ({ ImapFlow: vi.fn() }));
 vi.mock('./db.js', () => ({ query: vi.fn() }));
 vi.mock('./messageParser.js', () => ({ parseMessage: vi.fn(), buildSnippetFromHtml: vi.fn(), snippetFromBody: vi.fn(), decodeMimeWords: vi.fn(), detectBulkFromParsedHeaders: vi.fn(), parseRawHeaders: vi.fn(), enrichParsedMetadata: vi.fn((parsed) => parsed) }));
-vi.mock('../routes/oauth.js', () => ({ refreshMicrosoftToken: vi.fn() }));
+vi.mock('../routes/oauth.js', () => ({ refreshMicrosoftToken: vi.fn(), refreshGoogleToken: vi.fn() }));
 vi.mock('./emailSanitizer.js', () => ({ sanitizeEmail: vi.fn() }));
 vi.mock('./encryption.js', () => ({ decrypt: vi.fn() }));
 vi.mock('./aiProvider.js', () => ({ getAiStatus: vi.fn(), completeText: vi.fn() }));
@@ -11,8 +11,9 @@ vi.mock('./pushNotifications.js', () => ({ sendPushToUser: vi.fn() }));
 vi.mock('../utils/redact.js', () => ({ redactEmail: vi.fn() }));
 vi.mock('./hostValidation.js', () => ({ resolveForConnection: vi.fn(), createPinnedLookup: vi.fn() }));
 vi.mock('./connectionPolicy.js', () => ({ getConnectionPolicy: vi.fn() }));
+vi.mock('./spamPipeline.js', () => ({ classifyAndTagMessage: vi.fn() }));
 
-import { ImapManager, countMissingInboxCopies, fetchBackfillBatch, providerProfile, makeClientCfg, relocateExemptGuard, insertCopiedSibling, deleteMessageCopyRow, emitSectionsChanged, ensureMailbox, createKeyedSemaphore, isConnectionRefusal, connectCooldownMs, effectiveSyncIntervalMs, folderSyncDue, planModseqSync, connectStaggerFor, walkStructure, parsePersistentCap, resolvePersistentCap, persistentEligible, shouldRetryIPv4, classifyMoveBySearch } from './imapManager.js';
+import { ImapManager, MIN_SYNC_INTERVAL_MS, AUTO_IDLE_DELAY_MS, countMissingInboxCopies, fetchBackfillBatch, providerProfile, makeClientCfg, relocateExemptGuard, insertCopiedSibling, deleteMessageCopyRow, emitSectionsChanged, ensureMailbox, createKeyedSemaphore, isConnectionRefusal, connectCooldownMs, effectiveSyncIntervalMs, folderSyncDue, planModseqSync, connectStaggerFor, walkStructure, extractBodyFromMsg, bodyFallbackApplies, parsePersistentCap, resolvePersistentCap, persistentEligible, shouldRetryIPv4, classifyMoveBySearch } from './imapManager.js';
 import { pluginRegistry } from '../plugins/registry.js';
 import { EventEmitter } from 'node:events';
 import { ImapFlow } from 'imapflow';
@@ -21,6 +22,7 @@ import { resolveForConnection } from './hostValidation.js';
 import { getConnectionPolicy } from './connectionPolicy.js';
 import { invalidateGtdConfigCache } from '../plugins/gtd/gtdConfig.js';
 import { parseMessage } from './messageParser.js';
+import { classifyAndTagMessage } from './spamPipeline.js';
 
 const account = (imap_host, oauth_provider = null) => ({ imap_host, oauth_provider });
 
@@ -185,6 +187,45 @@ describe('relocateExemptGuard — label folder relocate exemption', () => {
     const { clause } = relocateExemptGuard(['Todo'], 7);
     expect(clause).toContain('$7::text[]');
     expect(clause).not.toContain('$5');
+  });
+});
+
+// ── makeClientCfg — auto-IDLE arming ─────────────────────────────────────────
+//
+// Regression cover for the bug where IDLE never started on ANY account. ImapFlow arms IDLE
+// only after autoIdleDelay of quiet; its default is 15000ms, which is exactly the fastest sync
+// interval the settings UI offers. A 15s tick left the connection quiet for ~14.9s and cleared
+// the arming timer ~100ms before it fired, so every provider silently degraded to polling.
+// The first test is the one that matters: it fails if those two values are ever equal again.
+
+describe('makeClientCfg — auto-IDLE arming', () => {
+  it('arms IDLE strictly faster than the fastest possible sync tick', () => {
+    // The invariant. If this fails, IDLE cannot start before the next tick interrupts it.
+    expect(AUTO_IDLE_DELAY_MS).toBeLessThan(MIN_SYNC_INTERVAL_MS);
+  });
+
+  it('leaves enough delay not to inject IDLE between one sync\'s own commands', () => {
+    // The opposite failure: too small a value means every command is followed by an IDLE the
+    // next command must break, costing two extra round trips each time.
+    expect(AUTO_IDLE_DELAY_MS).toBeGreaterThanOrEqual(1000);
+  });
+
+  it('sets autoIdleDelay whenever IDLE is enabled', () => {
+    const cfg = makeClientCfg(baseAccount, resolved, { enableIdle: true });
+    expect(cfg.autoIdleDelay).toBe(AUTO_IDLE_DELAY_MS);
+  });
+
+  it('does not set autoIdleDelay on non-IDLE connections (pool/backfill clients)', () => {
+    const cfg = makeClientCfg(baseAccount, resolved, { enableIdle: false });
+    expect(cfg.autoIdleDelay).toBeUndefined();
+  });
+
+  it('sets autoIdleDelay independently of idleKeepaliveMs', () => {
+    // maxIdleTime governs how long an IDLE lasts; autoIdleDelay governs whether it starts.
+    // Conflating the two is what let this bug survive the PurelyMail IDLE work.
+    const cfg = makeClientCfg(baseAccount, resolved, { enableIdle: true, idleKeepaliveMs: 4 * 60 * 1000 });
+    expect(cfg.maxIdleTime).toBe(4 * 60 * 1000);
+    expect(cfg.autoIdleDelay).toBe(AUTO_IDLE_DELAY_MS);
   });
 });
 
@@ -1317,6 +1358,119 @@ describe('walkStructure attachment classification', () => {
     expect(results.attachments).toHaveLength(1);
     expect(results.attachments[0].filename).toBe('invoice.pdf');
   });
+
+  it('treats an inline-disposed named HTML file alongside a body as an attachment', () => {
+    const results = walk({
+      type: 'multipart/mixed',
+      childNodes: [
+        { part: '1', type: 'text/html', encoding: 'quoted-printable' },
+        {
+          part: '2', type: 'text/html', encoding: 'base64', size: 4096,
+          disposition: 'inline', dispositionParameters: { filename: 'report.html' },
+        },
+      ],
+    });
+    expect(results.textParts.map(p => p.part)).toEqual(['1']);
+    expect(results.attachments).toHaveLength(1);
+    expect(results.attachments[0]).toMatchObject({
+      part: '2', filename: 'report.html', type: 'text/html', encoding: 'base64', size: 4096,
+    });
+  });
+
+  it('treats an undisposed text part named via Content-Type as an attachment', () => {
+    const results = walk({
+      type: 'multipart/mixed',
+      childNodes: [
+        { part: '1', type: 'text/plain', encoding: '7bit' },
+        { part: '2', type: 'text/plain', encoding: '7bit', parameters: { name: 'server.log' } },
+      ],
+    });
+    expect(results.textParts.map(p => p.part)).toEqual(['1']);
+    expect(results.attachments.map(a => a.filename)).toEqual(['server.log']);
+    expect(results.attachments[0].encoding).toBe('7bit');
+  });
+
+  it('keeps named text parts as body when no unnamed body part exists', () => {
+    const results = walk({
+      type: 'multipart/alternative',
+      childNodes: [
+        { part: '1', type: 'text/plain', encoding: '7bit', parameters: { name: 'body.txt' } },
+        { part: '2', type: 'text/html', encoding: '7bit', parameters: { name: 'body.html' } },
+      ],
+    });
+    expect(results.textParts.map(p => p.type)).toEqual(['text/plain', 'text/html']);
+    expect(results.attachments).toHaveLength(0);
+  });
+});
+
+describe('attachment-only messages have no body', () => {
+  const zipRoot = {
+    part: '1', type: 'application/zip', encoding: 'base64', size: 1024,
+    disposition: 'attachment',
+    dispositionParameters: { filename: 'google.com!example.com!1.zip' },
+  };
+
+  it('does not serve a single-part attachment root as the message text', () => {
+    // A DMARC aggregate report: the whole message is one application/zip part.
+    const msg = { bodyStructure: zipRoot, bodyParts: new Map([['1', Buffer.from('UEsDBBQ=')]]) };
+    const body = extractBodyFromMsg(msg);
+    expect(body.html).toBeNull();
+    expect(body.text).toBeNull();
+    expect(body.attachments.map(a => a.filename)).toEqual(['google.com!example.com!1.zip']);
+  });
+
+  it('does not fall back to the first part of a multipart holding only a file', () => {
+    const results = { textParts: [], attachments: [] };
+    walkStructure({ type: 'multipart/mixed', childNodes: [zipRoot] }, results);
+    expect(results.textParts).toHaveLength(0);
+    expect(bodyFallbackApplies(results)).toBe(false);
+  });
+
+  it('still promotes a bare unrecognized single part to text', () => {
+    const msg = {
+      bodyStructure: { part: '1', type: 'text/plain', encoding: '7bit', parameters: { charset: 'utf-8' } },
+      bodyParts: new Map([['1', Buffer.from('hello')]]),
+    };
+    expect(extractBodyFromMsg(msg).text).toBe('hello');
+    expect(bodyFallbackApplies({ textParts: [], attachments: [] })).toBe(true);
+  });
+});
+
+describe('calendar-only messages', () => {
+  const calendarRoot = {
+    part: '1', type: 'text/calendar', encoding: '7bit',
+    parameters: { charset: 'utf-8', method: 'REQUEST' },
+  };
+  const ics = 'BEGIN:VCALENDAR\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\nSUMMARY:Planning\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n';
+
+  it('collects a bare text/calendar root as a calendar part, not body text', () => {
+    const results = { textParts: [], attachments: [] };
+    walkStructure(calendarRoot, results);
+    expect(results.textParts).toHaveLength(0);
+    expect(results.calendarParts.map(p => p.part)).toEqual(['1']);
+    expect(bodyFallbackApplies(results)).toBe(false);
+  });
+
+  it('does not store raw VCALENDAR source as the synced body', () => {
+    const msg = { bodyStructure: calendarRoot, bodyParts: new Map([['1', Buffer.from(ics)]]) };
+    const body = extractBodyFromMsg(msg);
+    expect(body.text).toBeNull();
+    expect(body.html).toBeNull();
+  });
+
+  it('keeps the html alternative of a multipart invite as its body', () => {
+    const msg = {
+      bodyStructure: {
+        type: 'multipart/alternative',
+        childNodes: [
+          { part: '1', type: 'text/html', encoding: '7bit', parameters: { charset: 'utf-8' } },
+          { ...calendarRoot, part: '2' },
+        ],
+      },
+      bodyParts: new Map([['1', Buffer.from('<p>Invite</p>')], ['2', Buffer.from(ics)]]),
+    };
+    expect(extractBodyFromMsg(msg).html).toBe('<p>Invite</p>');
+  });
 });
 
 // ── _shouldAutoBackfillOnConnect — auto-backfill gate (#354) ──────────────────
@@ -2246,5 +2400,113 @@ describe('backfill optional metadata fallback', () => {
     const client = { fetch: vi.fn(async function* () { yield {uid:1}; throw new Error('Disconnected'); }) };
     await expect(collect(fetchBackfillBatch(client,[1,2],query))).rejects.toThrow('Disconnected');
     expect(client.fetch).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ── v0.2 antispam ingest hook (shared by syncMessages and backfillMessages) ──
+
+describe('maybeClassifyNewMessage — antispam ingest hook', () => {
+  beforeEach(() => { classifyAndTagMessage.mockReset(); });
+
+  it('does nothing for accounts with antispam disabled', () => {
+    const mgr = new ImapManager(null);
+    mgr.maybeClassifyNewMessage({ id: 'acct', antispam_enabled: false }, 'msg-1', { parsedHeaders: {} });
+    expect(classifyAndTagMessage).not.toHaveBeenCalled();
+  });
+
+  it('hands the new message to the pipeline with headers and the imap facade', () => {
+    const mgr = new ImapManager(null);
+    classifyAndTagMessage.mockResolvedValue({ verdict: 'spam' });
+    mgr.maybeClassifyNewMessage(
+      { id: 'acct', antispam_enabled: true }, 'msg-1',
+      { parsedHeaders: { 'authentication-results': 'mx.example.com; dkim=fail' } },
+    );
+    expect(classifyAndTagMessage).toHaveBeenCalledTimes(1);
+    const [messageId, opts] = classifyAndTagMessage.mock.calls[0];
+    expect(messageId).toBe('msg-1');
+    expect(opts.headers).toEqual({ 'authentication-results': 'mx.example.com; dkim=fail' });
+    expect(typeof opts.imap.moveMessage).toBe('function');
+    expect(typeof opts.imap.broadcast).toBe('function');
+    expect(typeof opts.imap._guardMoveUid).toBe('function');
+    expect(typeof opts.imap._unguardMoveUid).toBe('function');
+  });
+
+  it('defaults to an empty header list when the parsed message has none', () => {
+    const mgr = new ImapManager(null);
+    classifyAndTagMessage.mockResolvedValue(null);
+    mgr.maybeClassifyNewMessage({ id: 'acct', antispam_enabled: 1 }, 'msg-2', undefined);
+    expect(classifyAndTagMessage).toHaveBeenCalledWith('msg-2', expect.objectContaining({ headers: [] }));
+  });
+
+  it('swallows pipeline failures — sync must never break on classification', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const mgr = new ImapManager(null);
+    classifyAndTagMessage.mockRejectedValue(new Error('boom'));
+    expect(() => mgr.maybeClassifyNewMessage({ id: 'acct', antispam_enabled: true }, 'msg-3', {})).not.toThrow();
+    await new Promise(r => setTimeout(r, 0));
+    expect(warn).toHaveBeenCalled();
+    warn.mockRestore();
+  });
+
+  it('does not defer the auto-move on normal ingest (the sync path)', () => {
+    const mgr = new ImapManager(null);
+    classifyAndTagMessage.mockResolvedValue({ verdict: 'spam' });
+    mgr.maybeClassifyNewMessage({ id: 'acct', antispam_enabled: true }, 'msg-4', {});
+    expect(classifyAndTagMessage.mock.calls[0][1].deferAutoMove).toBe(false);
+  });
+
+  it('forwards deferAutoMove for the backfill path', () => {
+    const mgr = new ImapManager(null);
+    classifyAndTagMessage.mockResolvedValue({ verdict: 'spam' });
+    mgr.maybeClassifyNewMessage(
+      { id: 'acct', antispam_enabled: true }, 'msg-5', {}, { deferAutoMove: true },
+    );
+    expect(classifyAndTagMessage.mock.calls[0][1].deferAutoMove).toBe(true);
+  });
+
+  it('serializes auto-moves per account — one in flight, the rest queued', async () => {
+    const mgr = new ImapManager(null);
+    let releaseFirst;
+    const firstStarted = new Promise(resolve => { releaseFirst = resolve; });
+    const started = [];
+    const move = vi.spyOn(mgr, 'moveMessage').mockImplementation(async (_acct, uid) => {
+      started.push(uid);
+      if (uid === 1) await firstStarted;
+      return uid + 1000;
+    });
+    classifyAndTagMessage.mockResolvedValue({ verdict: 'spam' });
+    mgr.maybeClassifyNewMessage({ id: 'acct', antispam_enabled: true }, 'msg-6', {});
+    mgr.maybeClassifyNewMessage({ id: 'acct', antispam_enabled: true }, 'msg-7', {});
+    const facades = classifyAndTagMessage.mock.calls.map(call => call[1].imap);
+
+    const p1 = facades[0].moveMessage({ id: 'acct' }, 1, 'INBOX', 'Junk');
+    const p2 = facades[1].moveMessage({ id: 'acct' }, 2, 'INBOX', 'Junk');
+    await new Promise(r => setTimeout(r, 0));
+    // Only the first move reached the pool: the second is waiting for the slot, so a
+    // burst of classified messages cannot fan out concurrent moves (and overflow logins).
+    expect(started).toEqual([1]);
+
+    releaseFirst();
+    await expect(p1).resolves.toBe(1001);
+    await expect(p2).resolves.toBe(1002);
+    expect(started).toEqual([1, 2]);
+    expect(mgr._autoMoveSem.activeCount('acct')).toBe(0);
+    move.mockRestore();
+  });
+
+  it('releases the per-account slot after a failed move', async () => {
+    const mgr = new ImapManager(null);
+    const move = vi.spyOn(mgr, 'moveMessage')
+      .mockRejectedValueOnce(new Error('IMAP down'))
+      .mockResolvedValue(42);
+    classifyAndTagMessage.mockResolvedValue({ verdict: 'spam' });
+    mgr.maybeClassifyNewMessage({ id: 'acct', antispam_enabled: true }, 'msg-8', {});
+    const { imap } = classifyAndTagMessage.mock.calls[0][1];
+
+    await expect(imap.moveMessage({ id: 'acct' }, 1, 'INBOX', 'Junk')).rejects.toThrow('IMAP down');
+    expect(mgr._autoMoveSem.activeCount('acct')).toBe(0);
+    // A failed move must not wedge the account: the next one goes through.
+    await expect(imap.moveMessage({ id: 'acct' }, 2, 'INBOX', 'Junk')).resolves.toBe(42);
+    move.mockRestore();
   });
 });

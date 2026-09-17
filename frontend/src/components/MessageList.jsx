@@ -7,6 +7,8 @@ import { senderColor } from '../themes.js';
 import { useMobile } from '../hooks/useMobile.js';
 import { isAccountInUnifiedInbox } from '../utils/unifiedInbox.js';
 import { shouldSyncFolder, folderSyncKey } from '../utils/folderSync.js';
+import { resolveThreadMessages } from '../utils/threadActions.js';
+import { splitDraftSignature } from '../utils/draftSignature.js';
 import { useSwipeRow } from '../hooks/useSwipeRow.js';
 import ContextMenu from './ContextMenu.jsx';
 import RowHoverActions from './RowHoverActions.jsx';
@@ -19,6 +21,10 @@ import { formatDate } from '../utils/formatDate.js';
 import { advanceSelectionAfterRemoval } from '../utils/listSelection.js';
 import { openReplyFromMessage, openForwardFromMessage } from '../utils/composeFromMessage.js';
 import SenderAvatarImage from './SenderAvatarImage.jsx';
+import FolderPathLabel from './FolderPathLabel.jsx';
+import { folderMatchesQuery } from '../utils/folderDisplay.js';
+import SpamBadge from './SpamBadge.jsx';
+import SpamExplainModal from './SpamExplainModal.jsx';
 import { shortcutBus } from '../utils/shortcutBus.js';
 import { createLatestRequest } from '../utils/latestRequest.js';
 import { pendingMarkReadMap, completedMarkReadMap, setPending } from '../utils/pendingReads.js';
@@ -133,6 +139,8 @@ export default function MessageList() {
   const selectedMid = useStore(selectSelectedMessageMid);
 
   const isMobile = useMobile();
+  // Auto-spam explain modal target (opened from the badge on a row).
+  const [spamExplainMessageId, setSpamExplainMessageId] = useState(null);
   const isUnified = selectedAccountId === null;
   const selectedAccount = accounts.find(a => a.id === selectedAccountId);
   const unifiedInboxAccountKey = accounts
@@ -295,6 +303,9 @@ export default function MessageList() {
   // Bumped to force the search effect to re-run (e.g. after rules move messages) so an
   // active search snapshot drops messages that no longer match. See #223.
   const [searchReloadToken, setSearchReloadToken] = useState(0);
+  // Server/network failure of the active search (e.g. rate-limit 429). Shown in
+  // the empty state instead of a misleading "no results".
+  const [searchError, setSearchError] = useState(null);
 
   // Ref that always holds the latest values needed by shortcut handlers.
   // Updated synchronously on every render so handlers are never stale.
@@ -534,11 +545,13 @@ export default function MessageList() {
       setIsSearching(false);
       setSearchResults([]);
       setSearchHasMore(false);
+      setSearchError(null);
       searchFetchedOffsetRef.current = 0;
       return;
     }
     setIsSearching(true);
     setSearchHasMore(false);
+    setSearchError(null);
     const seq = ++searchSeq.current;
     searchTimer.current = setTimeout(async () => {
       try {
@@ -548,7 +561,15 @@ export default function MessageList() {
         setSearchResults(applyReadGuard(data.messages));
         setSearchHasMore(data.messages.length === searchPageSize);
       } catch (err) {
-        if (searchSeq.current === seq) console.error('Search failed:', err);
+        if (searchSeq.current === seq) {
+          console.error('Search failed:', err);
+          // Clear instead of leaving a previous query's results standing under
+          // the new query text, and surface the failure (a swallowed rate-limit
+          // 429 otherwise reads as "no results").
+          setSearchResults([]);
+          searchFetchedOffsetRef.current = 0;
+          setSearchError(err.message || 'Search failed');
+        }
       } finally {
         if (searchSeq.current === seq) setIsSearching(false);
       }
@@ -767,15 +788,20 @@ export default function MessageList() {
     return threadedView && !searchQuery.trim() && message.thread_id && messageCount > 1;
   }, [threadedView, searchQuery]);
 
-  const resolveMessagesForThreadAction = useCallback(async (message, { forceRefresh = false } = {}) => {
+  // Resolves the sub-messages a thread-wide action applies to. Defaults to the server rather
+  // than the expansion-time cache: a thread gains messages while you look at it, and acting on
+  // the snapshot left newer ones unread (unreachable, since the row then rendered as read) or,
+  // on the delete and move paths, silently untouched. See utils/threadActions.js.
+  const resolveMessagesForThreadAction = useCallback(async (message, { allowCache = false } = {}) => {
     const tid = message.thread_id || message.id;
-    if (!isThreadListRow(message)) return [message];
-    if (!forceRefresh && Array.isArray(threadMessages[tid]) && threadMessages[tid].length > 0) {
-      return threadMessages[tid];
-    }
     const effectiveFolder = selectedAccountId ? selectedFolder : 'INBOX';
-    const data = await api.getThread(tid, effectiveFolder, isUnified);
-    return data.messages?.length ? data.messages : [message];
+    return resolveThreadMessages({
+      message,
+      isThreadRow: isThreadListRow(message),
+      cached: threadMessages[tid],
+      allowCache,
+      fetchThread: () => api.getThread(tid, effectiveFolder, isUnified),
+    });
   }, [isThreadListRow, threadMessages, selectedAccountId, selectedFolder, isUnified]);
 
   const invalidateThreadCache = useCallback((threadId) => {
@@ -1384,6 +1410,12 @@ export default function MessageList() {
   })();
   // Keep scRef in sync so scheduleDelete can read displayMessages without a stale closure
   scRef.current.displayMessages = displayMessages;
+  // Same reason for the drag source: dragstart is synchronous and handleRowDragStart is
+  // registered once ([] deps), so it reads the thread predicate and the fetch context from
+  // here rather than closing over values that would be stale the moment the folder changes.
+  scRef.current.isThreadListRow = isThreadListRow;
+  scRef.current.threadFetchFolder = selectedAccountId ? selectedFolder : 'INBOX';
+  scRef.current.threadFetchUnified = isUnified;
 
   // Arrow-key navigation: intercepts ArrowDown/ArrowUp when the list container has focus.
   const handleListKeyDown = useCallback((e) => {
@@ -1563,11 +1595,21 @@ export default function MessageList() {
   }, []);
 
   const handleRowDragStart = useCallback((e, message) => {
-    const { selectedIds } = scRef.current;
+    const { selectedIds, isThreadListRow: isThreadRow, threadFetchFolder, threadFetchUnified } = scRef.current;
     const isMulti = selectedIds.size > 1 && selectedIds.has(message.id);
     const payload = isMulti
       ? { messageIds: [...selectedIds], accountId: message.account_id }
       : { messageId: message.id, accountId: message.account_id };
+    // A thread row stands for messages the client may never have loaded, so send the thread id
+    // and the context needed to fetch it rather than the one visible message: dropping it would
+    // otherwise move only the newest reply and leave the rest of the conversation behind.
+    // Multi-select keeps the plain per-message payload — a checkbox selection is explicit about
+    // what it covers, and silently widening it to whole threads would be worse than literal.
+    if (!isMulti && isThreadRow?.(message)) {
+      payload.threadId = message.thread_id || message.id;
+      payload.threadFolder = threadFetchFolder;
+      payload.threadUnified = threadFetchUnified;
+    }
     e.dataTransfer.setData('application/x-mailflow-message', JSON.stringify(payload));
     e.dataTransfer.effectAllowed = 'move';
   }, []);
@@ -1610,7 +1652,7 @@ export default function MessageList() {
         try {
           groups = await archiveTargetGroupsForRows(
             msgs,
-            message => resolveMessagesForThreadAction(message, { forceRefresh: true }),
+            message => resolveMessagesForThreadAction(message),
             activeFolder,
             isThreadListRow,
             selectedAccountId,
@@ -1722,7 +1764,7 @@ export default function MessageList() {
 
     let targets;
     try {
-      const resolved = await resolveMessagesForThreadAction(message, { forceRefresh: true });
+      const resolved = await resolveMessagesForThreadAction(message);
       targets = archiveTargetsForFolder(message, resolved, activeFolder, threadRow, selectedAccountId);
 
       const resolvedUnreadByAccount = unreadCountsByAccount(targets);
@@ -2306,6 +2348,14 @@ export default function MessageList() {
     if (isDraftsFolder) {
       try {
         const bodyData = await api.getMessageBody(message.id);
+        // A saved draft is one document: body, signature, then any quoted text. Handing all of
+        // it over as the body left the signature inline AND had compose render a fresh one, so
+        // every save/reopen cycle added another copy (#432). Lift the signature back out, or
+        // suppress compose's own when it is present but cannot be lifted safely.
+        const raw = bodyData.html || bodyData.text || '';
+        const { body, signature, inline } = bodyData.html
+          ? splitDraftSignature(raw)
+          : { body: raw, signature: null, inline: false };
         openCompose({
           accountId: message.account_id,
           draftUid: message.uid,
@@ -2313,8 +2363,9 @@ export default function MessageList() {
           to: formatAddressArray(message.to_addresses),
           cc: formatAddressArray(message.cc_addresses),
           subject: message.subject || '',
-          body: bodyData.html || bodyData.text || '',
+          body,
           bodyIsHtml: !!bodyData.html,
+          ...(signature !== null ? { signature } : inline ? { signature: '' } : {}),
         });
       } catch (err) {
         console.error('Failed to open draft:', err.message);
@@ -3326,10 +3377,12 @@ export default function MessageList() {
           <EmptyState
             folderSyncing={folderSyncing}
             searchQuery={searchQuery}
+            searchError={searchError}
             unreadOnly={unreadOnly}
             selectedFolder={selectedFolder}
             accounts={accounts}
             onClearSearch={() => { setSearchQuery(''); }}
+            onRetrySearch={() => setSearchReloadToken(token => token + 1)}
             onShowAll={() => setUnreadOnly(false)}
             onCompose={() => openCompose({ accountId: selectedAccountId || undefined })}
           />
@@ -3456,7 +3509,7 @@ export default function MessageList() {
                       {(() => {
                         const q = pickerSearch.trim().toLowerCase();
                         const displayed = pickerFolders
-                          .filter(f => f.path !== selectedFolder && (!q || f.name.toLowerCase().includes(q)));
+                          .filter(f => f.path !== selectedFolder && (!q || folderMatchesQuery(f, q)));
                         return displayed.length === 0 ? (
                           <div style={{ padding: '12px 12px', textAlign: 'center', color: 'var(--text-tertiary)', fontSize: 12 }}>
                             {t('contextMenu.folders.empty')}
@@ -3486,9 +3539,7 @@ export default function MessageList() {
                                 <span style={{ color: 'var(--text-tertiary)', flexShrink: 0 }}>
                                   <FolderIcon specialUse={f.special_use} />
                                 </span>
-                                <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                                  {f.name}
-                                </span>
+                                <FolderPathLabel folder={f} />
                               </button>
                             ))}
                           </>
@@ -3553,7 +3604,7 @@ export default function MessageList() {
                       ) : (() => {
                         const q = pickerSearch.trim().toLowerCase();
                         const displayed = pickerFolders
-                          .filter(f => f.path !== selectedFolder && (!q || f.name.toLowerCase().includes(q)));
+                          .filter(f => f.path !== selectedFolder && (!q || folderMatchesQuery(f, q)));
                         return displayed.length === 0 ? (
                           <div style={{ padding: '24px', textAlign: 'center', color: 'var(--text-tertiary)', fontSize: 13 }}>
                             {t('contextMenu.folders.empty')}
@@ -3575,9 +3626,7 @@ export default function MessageList() {
                             <span style={{ color: 'var(--text-tertiary)', flexShrink: 0 }}>
                               <FolderIcon specialUse={f.special_use} />
                             </span>
-                            <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                              {f.name}
-                            </span>
+                            <FolderPathLabel folder={f} />
                           </button>
                         ));
                       })()}
@@ -3638,6 +3687,7 @@ export default function MessageList() {
                   setContextMenu({ x: e.clientX, y: e.clientY, message: msg });
                 }}
                 onMove={handleRowMove}
+                onDragStart={handleRowDragStart}
                 isMobile={isMobile}
                 swipeLeftAction={swipeLeftAction}
                 swipeRightAction={swipeRightAction}
@@ -3648,6 +3698,7 @@ export default function MessageList() {
                 onToggleSelect={handleRowToggleSelect}
                 onRangeSelect={handleRangeSelect}
                 onLongPress={isMobile ? (id) => { setSelectionModeActive(true); toggleSelect(id); } : undefined}
+                onExplainSpam={(msg) => setSpamExplainMessageId(msg.id)}
               />
             );
           })
@@ -3688,6 +3739,7 @@ export default function MessageList() {
                 onSwipeLeft={selectionMode || swipeLeftAction === 'disabled' ? undefined : (msg) => runSwipeAction(swipeLeftAction, msg)}
                 onSwipeRight={selectionMode || swipeRightAction === 'disabled' ? undefined : (msg) => runSwipeAction(swipeRightAction, msg)}
                 onLongPress={isMobile ? (id) => { setSelectionModeActive(true); toggleSelect(id); } : undefined}
+                onExplainSpam={(msg) => setSpamExplainMessageId(msg.id)}
               />
             );
           })
@@ -3701,6 +3753,13 @@ export default function MessageList() {
             defaultMoveView={contextMenu.defaultMoveView}
             onClose={() => setContextMenu(null)}
             onAction={(action, data) => handleContextAction(action, contextMenu.message, data)}
+          />
+        )}
+
+        {spamExplainMessageId && (
+          <SpamExplainModal
+            messageId={spamExplainMessageId}
+            onClose={() => setSpamExplainMessageId(null)}
           />
         )}
 
@@ -3988,7 +4047,7 @@ function UndoBar({ notification, onDismiss, showTopBorder }) {
   );
 }
 
-function EmptyState({ folderSyncing, searchQuery, unreadOnly, selectedFolder, accounts, onClearSearch, onShowAll, onCompose }) {
+function EmptyState({ folderSyncing, searchQuery, searchError, unreadOnly, selectedFolder, accounts, onClearSearch, onRetrySearch, onShowAll, onCompose }) {
   const { t } = useTranslation();
 
   if (folderSyncing) {
@@ -4016,10 +4075,18 @@ function EmptyState({ folderSyncing, searchQuery, unreadOnly, selectedFolder, ac
             <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
           </svg>
         </div>
-        <div style={{ fontSize: 15, fontWeight: 500, color: 'var(--text-primary)', marginBottom: 6 }}>{t('messageList.noSearchResults')}</div>
-        <div style={{ fontSize: 13, color: 'var(--text-tertiary)', marginBottom: 20 }}>
-          {t('messageList.noSearchResultsDesc', { query: searchQuery })}
+        <div style={{ fontSize: 15, fontWeight: 500, color: 'var(--text-primary)', marginBottom: 6 }}>
+          {searchError ? t('messageList.searchFailed') : t('messageList.noSearchResults')}
         </div>
+        <div style={{ fontSize: 13, color: searchError ? 'var(--red)' : 'var(--text-tertiary)', marginBottom: 20 }}>
+          {searchError || t('messageList.noSearchResultsDesc', { query: searchQuery })}
+        </div>
+        {searchError && (
+          <button onClick={onRetrySearch} style={{
+            padding: '7px 18px', borderRadius: 8, border: 'none', marginRight: 8,
+            background: 'var(--accent)', color: 'var(--accent-text)', cursor: 'pointer', fontSize: 13,
+          }}>{t('common.retry')}</button>
+        )}
         <button onClick={onClearSearch} style={{
           padding: '7px 18px', borderRadius: 8, border: '1px solid var(--border)',
           background: 'transparent', color: 'var(--text-secondary)', cursor: 'pointer', fontSize: 13,
@@ -4104,7 +4171,7 @@ function EmptyState({ folderSyncing, searchQuery, unreadOnly, selectedFolder, ac
   );
 }
 
-function ThreadRow({ message, isExpanded, threadMsgs, isLoadingThread, selectedMessageId, selectedMid, lastViewedMessageId, showAccount, isNarrow, onThreadClick, onThreadToggle, showMobileAvatars, showMessagePreviews, onSelect, onOpenWindow, onMarkRead, onStar, onDelete, hoverQuickActions, onContextMenu, onMove, isMobile, swipeLeftAction, swipeRightAction, onSwipeLeft, onSwipeRight, isChecked, selectionMode, onToggleSelect, onRangeSelect, onLongPress }) {
+function ThreadRow({ message, isExpanded, threadMsgs, isLoadingThread, selectedMessageId, selectedMid, lastViewedMessageId, showAccount, isNarrow, onThreadClick, onThreadToggle, showMobileAvatars, showMessagePreviews, onSelect, onOpenWindow, onMarkRead, onStar, onDelete, hoverQuickActions, onContextMenu, onMove, onDragStart, isMobile, swipeLeftAction, swipeRightAction, onSwipeLeft, onSwipeRight, isChecked, selectionMode, onToggleSelect, onRangeSelect, onLongPress, onExplainSpam }) {
   const { t } = useTranslation();
   const [hovered, setHovered] = useState(false);
   const messageCount = message.message_count || 1;
@@ -4151,6 +4218,13 @@ function ThreadRow({ message, isExpanded, threadMsgs, isLoadingThread, selectedM
       <div
         ref={isMobile ? contentRef : undefined}
         className={isMobile ? 'no-callout' : undefined}
+        // Drag-to-folder (#130). Threading renders every row through ThreadRow, which never
+        // had drag wired up — so with conversations on, no row was draggable and the browser
+        // fell back to selecting the row's text. Never a regression: the two features simply
+        // never worked together. The payload carries the thread id so the drop resolves the
+        // whole conversation from the server; see handleRowDragStart.
+        draggable={!isMobile}
+        onDragStart={!isMobile && onDragStart ? (e) => onDragStart(e, message) : undefined}
         onMouseEnter={() => !isMobile && setHovered(true)}
         onMouseLeave={() => !isMobile && setHovered(false)}
         onClick={selectionMode ? (e) => {
@@ -4303,11 +4377,15 @@ function ThreadRow({ message, isExpanded, threadMsgs, isLoadingThread, selectedM
           </div>
           {/* Row 2: subject */}
           <div style={{
+            display: 'flex', alignItems: 'center', gap: 4,
             fontSize: 12, fontWeight: unreadCount > 0 ? 500 : 400,
             color: unreadCount > 0 ? 'var(--text-primary)' : 'var(--text-secondary)',
-            overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', marginBottom: 2,
+            marginBottom: 2,
           }}>
-            {message.subject || t('common.noSubject')}
+            <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+              {message.subject || t('common.noSubject')}
+            </span>
+            <SpamBadge message={message} onClick={onExplainSpam} />
           </div>
           {/* Row 3: snippet */}
           {showMessagePreviews && (
@@ -4398,7 +4476,7 @@ function ThreadRow({ message, isExpanded, threadMsgs, isLoadingThread, selectedM
   );
 }
 
-function MessageRow({ message, selected, lastViewed, isChecked, selectionMode, showAccount, isNarrow, onSelect, onOpenWindow, onToggleSelect, onRangeSelect, onAvatarClick, showMobileAvatars, showMessagePreviews, onMarkRead, onStar, onDelete, hoverQuickActions, onContextMenu, onMove, onDragStart, isMobile, swipeLeftAction, swipeRightAction, onSwipeLeft, onSwipeRight, onLongPress }) {
+function MessageRow({ message, selected, lastViewed, isChecked, selectionMode, showAccount, isNarrow, onSelect, onOpenWindow, onToggleSelect, onRangeSelect, onAvatarClick, showMobileAvatars, showMessagePreviews, onMarkRead, onStar, onDelete, hoverQuickActions, onContextMenu, onMove, onDragStart, isMobile, swipeLeftAction, swipeRightAction, onSwipeLeft, onSwipeRight, onLongPress, onExplainSpam }) {
   const { t } = useTranslation();
   const [hovered, setHovered] = useState(false);
   const [avatarHovered, setAvatarHovered] = useState(false);
@@ -4622,12 +4700,15 @@ function MessageRow({ message, selected, lastViewed, isChecked, selectionMode, s
 
         {/* Row 2: Subject */}
         <div style={{
+          display: 'flex', alignItems: 'center', gap: 4,
           fontSize: 13, fontWeight: message.is_read ? 400 : 500,
           color: message.is_read ? 'var(--text-secondary)' : 'var(--text-primary)',
-          overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
           marginBottom: 3,
         }}>
-          {message.subject || t('message.noSubject')}
+          <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            {message.subject || t('message.noSubject')}
+          </span>
+          <SpamBadge message={message} onClick={onExplainSpam} />
         </div>
 
         {/* Row 3: Snippet */}

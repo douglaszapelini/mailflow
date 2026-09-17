@@ -11,12 +11,20 @@ import { pendingMarkReadMap, completedMarkReadMap, setPending } from '../utils/p
 import DOMPurify from 'dompurify';
 import { BUILTIN_SUMMARIZE, summarizePromptForLocale } from '../aiActions.js';
 import { getResults, saveResult, removeResult } from '../aiResults.js';
+import { aiRuns } from '../utils/aiRunRegistry.js';
 import { renderMarkdown } from '../utils/renderMarkdown.js';
 import { pickReplyAlias } from '../utils/replyAlias.js';
 import { measureContentHeight, createHeightController, forceEagerImages } from '../utils/emailFrameHeight.js';
 import { copyToClipboard } from '../utils/clipboard.js';
+import { folderMatchesQuery } from '../utils/folderDisplay.js';
+import FolderPathLabel from './FolderPathLabel.jsx';
+import SpamBadge from './SpamBadge.jsx';
+import SpamExplainModal from './SpamExplainModal.jsx';
+import { classifyAttachmentRisk } from '../utils/attachmentRisk.js';
 const USE_DIV_RENDER = import.meta.env.VITE_EMAIL_DIV_RENDER === 'true';
 const MESSAGE_OPENING_EVENT = 'mailflow:message-opening';
+// riskArmed value for the "Download all" link. Attachment parts are dotted numbers, so it cannot collide.
+const DOWNLOAD_ALL = 'all';
 
 // Module-level regex so the spam-name heuristic isn't recompiled on every
 // render — same heuristic as ContextMenu.jsx, both files read this constant.
@@ -204,9 +212,11 @@ export default function MessagePane({ windowMessageId = null, onWindowClose = nu
   }, [selectedMessageId]);
 
   useEffect(() => {
-    // Abort any actions still streaming for the previous message.
-    Object.values(aiAbortRefs.current).forEach(c => c?.abort());
-    aiAbortRefs.current = {};
+    // Deliberately does NOT abort in-flight actions. They persist their own result against the
+    // message they were started from, so leaving a message lets the work finish instead of
+    // discarding it (#428). Only dismissal, re-running the same action, and an identity change
+    // (logout, account switch, lock) cancel a run. Unmount deliberately does not.
+    viewingMsgIdRef.current = selectedMessageId;
     setShowAiMenu(false);
     // Restore persisted results (#204) so they reappear instead of vanishing.
     const saved = getResults(selectedMessageId);
@@ -307,6 +317,7 @@ export default function MessagePane({ windowMessageId = null, onWindowClose = nu
   const [moveSearch, setMoveSearch] = useState('');
   const [showMoreMenu, setShowMoreMenu] = useState(false);
   const [contextMenu, setContextMenu] = useState(null);
+  const [spamExplainMessageId, setSpamExplainMessageId] = useState(null);
   const [findDialogOpen, setFindDialogOpen] = useState(false);
   const [findQuery, setFindQuery] = useState('');
   const [findMatchCase, setFindMatchCase] = useState(false);
@@ -323,8 +334,12 @@ export default function MessagePane({ windowMessageId = null, onWindowClose = nu
   const moveBtnRef = useRef(null);
   const moreMenuRef = useRef(null);
   const aiMenuRef = useRef(null);
-  // One AbortController per in-flight action, keyed by action key.
-  const aiAbortRefs = useRef({});
+  // In-flight AI actions live in a module-level registry, keyed by message AND action, so they
+  // outlive this component. Navigating, closing a pop-out and changing layout all deliberately
+  // leave them running: the result is saved against the message it was started from, so letting
+  // the request finish is what puts it there when you return (#428). utils/aiRunRegistry.js.
+  // The message currently on screen, read inside async callbacks that outlive a navigation.
+  const viewingMsgIdRef = useRef(selectedMessageId);
   const scrollContainerRef = useRef(null);
   const iframeRef = useRef(null);
   const roRef = useRef(null);
@@ -1254,11 +1269,12 @@ ${bodyContent}
     if (!textContent) return;
 
     const label = aiActionLabel(key, action.label);
-    aiAbortRefs.current[key]?.abort();
-    const ctrl = new AbortController();
-    aiAbortRefs.current[key] = ctrl;
     const msgId = selectedMessageId;
-    setAiResults(r => ({ ...r, [key]: { status: 'loading', text: '', label } }));
+    const ctrl = aiRuns.start(msgId, key, new AbortController());
+    // Only paint into the pane while the message this run belongs to is the one on screen.
+    // A run that outlives a navigation still saves; the restore on return shows it.
+    const applyIfViewing = (updater) => { if (viewingMsgIdRef.current === msgId) setAiResults(updater); };
+    applyIfViewing(r => ({ ...r, [key]: { status: 'loading', text: '', label } }));
     // The built-in Summarize prompt is uneditable, so steer its output to the
     // user's UI language (#255). Custom actions keep their author's prompt as-is.
     const promptText = action.builtin ? summarizePromptForLocale(i18n.language) : action.prompt;
@@ -1269,21 +1285,23 @@ ${bodyContent}
       }], {
         signal: ctrl.signal,
         onDelta: (text) => {
-          setAiResults(r => ({ ...r, [key]: { status: 'loading', text, label } }));
+          applyIfViewing(r => ({ ...r, [key]: { status: 'loading', text, label } }));
         },
       });
-      setAiResults(r => ({ ...r, [key]: { status: 'done', text: fullText, label } }));
-      // Persist only completed results, keyed to the message it ran against.
+      applyIfViewing(r => ({ ...r, [key]: { status: 'done', text: fullText, label } }));
+      // Persist unconditionally: this is the whole point when the user has navigated away.
       if (fullText) saveResult(msgId, key, fullText, label);
     } catch (err) {
       if (err.name === 'AbortError') return;
-      setAiResults(r => ({ ...r, [key]: { status: 'error', text: err.message, label } }));
+      applyIfViewing(r => ({ ...r, [key]: { status: 'error', text: err.message, label } }));
+    } finally {
+      aiRuns.finish(msgId, key);
     }
   };
 
   // Dismiss a pinned result box and drop its cached copy.
   const dismissAiResult = (key) => {
-    aiAbortRefs.current[key]?.abort();
+    aiRuns.abort(selectedMessageId, key);
     removeResult(selectedMessageId, key);
     setAiResults(r => { const next = { ...r }; delete next[key]; return next; });
   };
@@ -1342,8 +1360,15 @@ ${bodyContent}
 
   useEffect(() => {
     api.ai.status().then(setAiStatus).catch(() => {});
-    return () => { Object.values(aiAbortRefs.current).forEach(c => c?.abort()); };
+    // No abort on unmount: the pane also unmounts when a pop-out closes or the layout changes,
+    // and a run the user is still waiting for must survive that. Identity changes cancel runs
+    // instead, from the store, where logout and account switch are actually known about.
   }, []);
+
+  // riskArmed: a risky attachment needs a second click to download; the first
+  // arms the button and shows why. Holds the attachment's part, or DOWNLOAD_ALL.
+  const [riskArmed, setRiskArmed] = useState(null);
+  useEffect(() => { setRiskArmed(null); }, [selectedMessageId]);
 
   const handleDownload = async (messageId, part, filename) => {
     setDownloadingPart(part);
@@ -1928,6 +1953,23 @@ ${bodyContent}
   })();
 
   const attachments = body?.attachments || [];
+  // "Download all" hands over every file at once, so it asks first whenever one of them would. While
+  // it does, the link has no href, so a right-click "Save link as", a middle click or a long press has
+  // nothing to fetch; the confirming click starts the download itself.
+  const anyRiskyAttachment = attachments.some(att =>
+    ['block', 'warn'].includes(classifyAttachmentRisk(att.filename, att.type).level));
+  const downloadAllArmed = riskArmed === DOWNLOAD_ALL;
+  const downloadAllUrl = message ? `/api/mail/messages/${message.id}/attachments.zip` : '';
+  const confirmDownloadAll = () => {
+    if (!downloadAllArmed) { setRiskArmed(DOWNLOAD_ALL); return; }
+    setRiskArmed(null);
+    const a = document.createElement('a');
+    a.href = downloadAllUrl;
+    a.download = '';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+  };
 
   return (
     <div
@@ -2136,7 +2178,7 @@ ${bodyContent}
                     const q = moveSearch.trim().toLowerCase();
                     if (q) {
                       const filtered = movePickerFolders
-                        .filter(f => f.path !== message.folder && f.name.toLowerCase().includes(q));
+                        .filter(f => f.path !== message.folder && folderMatchesQuery(f, q));
                       return filtered.length === 0 ? (
                         <div style={{ padding: '12px 12px', textAlign: 'center', color: 'var(--text-tertiary)', fontSize: 12 }}>
                           {t('contextMenu.folders.empty')}
@@ -2150,7 +2192,7 @@ ${bodyContent}
                           onMouseLeave={e => e.currentTarget.style.background = 'none'}
                         >
                           <span style={{ color: 'var(--text-tertiary)', flexShrink: 0 }}><FolderIcon specialUse={f.special_use} /></span>
-                          <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{f.name}</span>
+                          <FolderPathLabel folder={f} />
                         </button>
                       ));
                     }
@@ -2170,7 +2212,7 @@ ${bodyContent}
                                 onMouseLeave={e => e.currentTarget.style.background = 'none'}
                               >
                                 <span style={{ color: 'var(--text-tertiary)', flexShrink: 0 }}><FolderIcon specialUse={f.special_use} /></span>
-                                <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{f.name}</span>
+                                <FolderPathLabel folder={f} />
                               </button>
                             ))}
                             <div style={{ height: 1, background: 'var(--border-subtle)', margin: '3px 0' }} />
@@ -2190,7 +2232,7 @@ ${bodyContent}
                                 onMouseLeave={e => e.currentTarget.style.background = 'none'}
                               >
                                 <span style={{ color: 'var(--text-tertiary)', flexShrink: 0 }}><FolderIcon specialUse={f.special_use} /></span>
-                                <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{f.name}</span>
+                                <FolderPathLabel folder={f} />
                               </button>
                             ))}
                             <div style={{ height: 1, background: 'var(--border-subtle)', margin: '3px 0' }} />
@@ -2207,7 +2249,7 @@ ${bodyContent}
                               onMouseLeave={e => e.currentTarget.style.background = 'none'}
                             >
                               <span style={{ color: 'var(--text-tertiary)', flexShrink: 0 }}><FolderIcon specialUse={f.special_use} /></span>
-                              <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{f.name}</span>
+                              <FolderPathLabel folder={f} />
                             </button>
                           ))
                         }
@@ -2245,10 +2287,10 @@ ${bodyContent}
                     onMouseEnter={e => e.currentTarget.style.background = 'var(--bg-hover)'}
                     onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
                   >
-                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round">
-                      <path d="M22,9v9c0,1.1-.9,2-2,2H4c-1.1,0-2-.9-2-2V9"/>
-                      <polyline points="22 9 12 16 2 9"/>
-                      <polyline points="22 9 12 2 22 9"/>
+                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75">
+                      <path style={{strokeLinecap: 'round'}} d="M22,10.91v7.09c0,1.1-.9,2-2,2H4c-1.1,0-2-.9-2-2V6c0-1.1.9-2,2-2h11"/>
+                      <polyline style={{strokeLinecap: 'round'} } points="16.36 9.95 12 13 2 6"/>
+                      <circle style={{strokeMiterlimit: 10, fill: 'currentColor'}} cx="19.96" cy="6" r="3"/>
                     </svg>
                     {t('contextMenu.markUnread')}
                   </div>
@@ -2378,10 +2420,10 @@ ${bodyContent}
             )}
             {message.is_read && (
               <PaneBtn onClick={handleMarkUnread} title={t('contextMenu.markUnread')}>
-                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round">
-                  <path d="M22,9v9c0,1.1-.9,2-2,2H4c-1.1,0-2-.9-2-2V9"/>
-                  <polyline points="22 9 12 16 2 9"/>
-                  <polyline points="22 9 12 2 22 9"/>
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75">
+                  <path style={{strokeLinecap: 'round'}} d="M22,10.91v7.09c0,1.1-.9,2-2,2H4c-1.1,0-2-.9-2-2V6c0-1.1.9-2,2-2h11"/>
+                  <polyline style={{strokeLinecap: 'round'} } points="16.36 9.95 12 13 2 6"/>
+                  <circle style={{strokeMiterlimit: 10, fill: 'currentColor'}} cx="19.96" cy="6" r="3"/>
                 </svg>
               </PaneBtn>
             )}
@@ -2472,12 +2514,17 @@ ${bodyContent}
             color: 'var(--text-primary)', lineHeight: 1.3,
             fontFamily: 'var(--font-display)',
           }}>
-            {(() => {
-              const paneSubject = resolvedSubject || message.subject;
-              return (paneSubject && paneSubject !== '(no subject)')
-                ? paneSubject
-                : t('message.noSubject');
-            })()}
+            <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 6 }}>
+              <span>
+                {(() => {
+                  const paneSubject = resolvedSubject || message.subject;
+                  return (paneSubject && paneSubject !== '(no subject)')
+                    ? paneSubject
+                    : t('message.noSubject');
+                })()}
+              </span>
+              <SpamBadge message={message} onClick={(m) => setSpamExplainMessageId(m.id)} />
+            </div>
           </div>
 
           <div style={{ display: 'flex', alignItems: 'flex-start', gap: 12, padding: '12px 16px' }}>
@@ -2612,11 +2659,15 @@ ${bodyContent}
               </div>
               {attachments.length > 1 && (
                 <a
-                  href={`/api/mail/messages/${message.id}/attachments.zip`}
-                  download
+                  {...(anyRiskyAttachment ? {
+                    role: 'button',
+                    tabIndex: 0,
+                    onClick: confirmDownloadAll,
+                    onKeyDown: e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); confirmDownloadAll(); } },
+                  } : { href: downloadAllUrl, download: true })}
                   style={{
-                    fontSize: 12, color: 'var(--accent)', textDecoration: 'none',
-                    display: 'flex', alignItems: 'center', gap: 4,
+                    fontSize: 12, color: downloadAllArmed ? 'var(--red)' : 'var(--accent)', textDecoration: 'none',
+                    display: 'flex', alignItems: 'center', gap: 4, cursor: 'pointer',
                   }}
                 >
                   <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
@@ -2625,20 +2676,30 @@ ${bodyContent}
                     <line x1="12" y1="15" x2="12" y2="3"/>
                   </svg>
                   {t('message.downloadAll')}
+                  {downloadAllArmed && ` — ${t('message.attachmentRisk.confirm')}`}
                 </a>
               )}
             </div>
             <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
-              {attachments.map((att, i) => (
+              {attachments.map((att, i) => {
+                const risk = classifyAttachmentRisk(att.filename, att.type);
+                const risky = risk.level === 'block' || risk.level === 'warn';
+                const riskColor = risk.level === 'block' ? 'var(--red)' : risk.level === 'warn' ? 'var(--amber)' : 'var(--text-tertiary)';
+                const armed = riskArmed === att.part;
+                return (
                 <button
                   key={i}
-                  onClick={() => handleDownload(message.id, att.part, att.filename)}
+                  onClick={() => {
+                    if (risky && !armed) { setRiskArmed(att.part); return; }
+                    setRiskArmed(null);
+                    handleDownload(message.id, att.part, att.filename);
+                  }}
                   disabled={downloadingPart === att.part}
                   style={{
                     display: 'flex', alignItems: 'center', gap: 8,
                     padding: '8px 12px', borderRadius: 8,
                     background: 'var(--bg-secondary)',
-                    border: '1px solid var(--border)',
+                    border: `1px solid ${risky ? riskColor : 'var(--border)'}`,
                     cursor: downloadingPart === att.part ? 'wait' : 'pointer',
                     color: 'var(--text-primary)',
                     transition: 'background 0.1s',
@@ -2658,6 +2719,14 @@ ${bodyContent}
                     <div style={{ fontSize: 11, color: 'var(--text-tertiary)' }}>
                       {downloadingPart === att.part ? t('message.downloading') : formatBytes(att.size)}
                     </div>
+                    {risk.level !== 'ok' && (
+                      <div style={{ fontSize: 11, color: riskColor, fontWeight: risk.level === 'block' ? 600 : 400, whiteSpace: 'normal' }}>
+                        {risk.doubleExt
+                          ? t('message.attachmentRisk.doubleExt', { ext: risk.doubleExt })
+                          : t(`message.attachmentRisk.${risk.level}`, { ext: risk.ext })}
+                        {armed && ` — ${t('message.attachmentRisk.confirm')}`}
+                      </div>
+                    )}
                   </div>
                   <svg width="13" height="13" viewBox="0 0 24 24" fill="none"
                     stroke="var(--text-tertiary)" strokeWidth="2" style={{ flexShrink: 0 }}>
@@ -2666,7 +2735,8 @@ ${bodyContent}
                     <line x1="12" y1="15" x2="12" y2="3"/>
                   </svg>
                 </button>
-              ))}
+                );
+              })}
             </div>
           </div>
         )}
@@ -3063,7 +3133,7 @@ ${bodyContent}
                 const q = moveSearch.trim().toLowerCase();
                 if (q) {
                   const filtered = movePickerFolders
-                    .filter(f => f.path !== message.folder && f.name.toLowerCase().includes(q));
+                    .filter(f => f.path !== message.folder && folderMatchesQuery(f, q));
                   return filtered.length === 0 ? (
                     <div style={{ padding: '24px', textAlign: 'center', color: 'var(--text-tertiary)', fontSize: 13 }}>
                       {t('contextMenu.folders.empty')}
@@ -3075,7 +3145,7 @@ ${bodyContent}
                       style={{ display: 'flex', alignItems: 'center', gap: 14, width: '100%', minHeight: 48, padding: '0 20px', background: 'none', border: 'none', borderBottom: '1px solid var(--border-subtle)', color: 'var(--text-primary)', fontSize: 15, cursor: 'pointer', textAlign: 'left' }}
                     >
                       <span style={{ color: 'var(--text-tertiary)', flexShrink: 0 }}><FolderIcon specialUse={f.special_use} size={18} /></span>
-                      <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{f.name}</span>
+                      <FolderPathLabel folder={f} />
                     </button>
                   ));
                 }
@@ -3093,7 +3163,7 @@ ${bodyContent}
                             style={{ display: 'flex', alignItems: 'center', gap: 14, width: '100%', minHeight: 48, padding: '0 20px', background: 'none', border: 'none', borderBottom: '1px solid var(--border-subtle)', color: 'var(--text-primary)', fontSize: 15, cursor: 'pointer', textAlign: 'left' }}
                           >
                             <span style={{ color: 'var(--text-tertiary)', flexShrink: 0 }}><FolderIcon specialUse={f.special_use} size={18} /></span>
-                            <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{f.name}</span>
+                            <FolderPathLabel folder={f} />
                           </button>
                         ))}
                         <div style={{ height: 1, background: 'var(--border-subtle)', margin: '3px 0' }} />
@@ -3111,7 +3181,7 @@ ${bodyContent}
                             style={{ display: 'flex', alignItems: 'center', gap: 14, width: '100%', minHeight: 48, padding: '0 20px', background: 'none', border: 'none', borderBottom: '1px solid var(--border-subtle)', color: 'var(--text-primary)', fontSize: 15, cursor: 'pointer', textAlign: 'left' }}
                           >
                             <span style={{ color: 'var(--text-tertiary)', flexShrink: 0 }}><FolderIcon specialUse={f.special_use} size={18} /></span>
-                            <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{f.name}</span>
+                            <FolderPathLabel folder={f} />
                           </button>
                         ))}
                         <div style={{ height: 1, background: 'var(--border-subtle)', margin: '3px 0' }} />
@@ -3126,7 +3196,7 @@ ${bodyContent}
                           style={{ display: 'flex', alignItems: 'center', gap: 14, width: '100%', minHeight: 48, padding: '0 20px', background: 'none', border: 'none', borderBottom: '1px solid var(--border-subtle)', color: 'var(--text-primary)', fontSize: 15, cursor: 'pointer', textAlign: 'left' }}
                         >
                           <span style={{ color: 'var(--text-tertiary)', flexShrink: 0 }}><FolderIcon specialUse={f.special_use} size={18} /></span>
-                          <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{f.name}</span>
+                          <FolderPathLabel folder={f} />
                         </button>
                       ))
                     }
@@ -3266,6 +3336,13 @@ ${bodyContent}
             setResolvedSubject(s);
             updateMessage(message.id, { subject: s });
           }}
+        />
+      )}
+
+      {spamExplainMessageId && (
+        <SpamExplainModal
+          messageId={spamExplainMessageId}
+          onClose={() => setSpamExplainMessageId(null)}
         />
       )}
 

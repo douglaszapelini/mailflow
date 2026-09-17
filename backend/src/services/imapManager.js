@@ -1,11 +1,11 @@
 import { FolderStatusMonitor, checkpointFolderStatus } from './folderStatus.js';
 import { ImapFlow } from 'imapflow';
 import { query } from './db.js';
-import { parseMessage, snippetFromBody, detectBulkFromParsedHeaders, parseHeadersInput, headersToRawString, decodeMimeWords, enrichParsedMetadata } from './messageParser.js';
+import { parseMessage, snippetFromBody, detectBulkFromParsedHeaders, parseHeadersInput, headersToRawString, decodeMimeWords, enrichParsedMetadata, renderCalendarInvite } from './messageParser.js';
 import { classifyMessage, loadSocialDomains, getGlobalCategorizationEnabled } from './categorizer.js';
 import { pluginRegistry } from '../plugins/registry.js';
 import { createPluginMailFacade } from '../plugins/mailEngineFacade.js';
-import { refreshMicrosoftToken } from '../routes/oauth.js';
+import { refreshMicrosoftToken, refreshGoogleToken } from '../routes/oauth.js';
 import { sanitizeEmail } from './emailSanitizer.js';
 import { logger } from './logger.js';
 import { recordBroadcast, recordWarning, recordSyncSignal } from './diagnosticsRing.js';
@@ -16,6 +16,7 @@ import { adjustFolderCounts, resolveSpamFolder } from '../utils/mailUtils.js';
 import { resolveForConnection, createPinnedLookup } from './hostValidation.js';
 import { getConnectionPolicy } from './connectionPolicy.js';
 import { applyInboxRules, applyBlockList } from './inboxRules.js';
+import { classifyAndTagMessage } from './spamPipeline.js';
 import { generateVCard } from '../utils/vcard.js';
 import { randomUUID } from 'crypto';
 
@@ -185,6 +186,23 @@ export function createKeyedSemaphore(limit) {
 // (IDLE + the periodic interval) is separate and always flows. Keyed by host, so other
 // providers/accounts are unaffected. See _bgConnSem.
 const BACKGROUND_CONN_MAX_PER_HOST = 2;
+
+// Concurrent auto-moves (spamPipeline's move to the spam folder) allowed per account.
+//
+// The classification itself is cheap and stays concurrent; only the IMAP move is queued. A move
+// goes through the pooled connection (POOL_SIZE = 2) and each loser of its 10s overflow timeout
+// opens a FRESH login, so a burst of classifications used to fan out that many concurrent moves
+// and fresh logins on a single account — the connection-storm pattern providers throttle accounts
+// for. Bursts are real: an ingest pass classifies up to 100 new messages at once on the
+// folder-status/reindex-driven paths. Serializing per account keeps at most one auto-move in
+// flight, with the rest queued FIFO on the same connection budget the user's own work uses.
+// PR review, 2026-09-15.
+const AUTO_MOVE_MAX_CONCURRENT_PER_ACCOUNT = 1;
+
+// How long a queued auto-move waits for its per-account slot before giving up. The verdict is
+// already persisted by then, so a timeout only means "tagged, not moved" — the message keeps its
+// badge and stays where it is rather than the queue growing without bound behind a stuck move.
+const AUTO_MOVE_QUEUE_TIMEOUT_MS = 120 * 1000;
 
 // Consecutive recoverable failures before an account is shown as broken in the UI.
 //
@@ -367,6 +385,23 @@ const SNIPPET_BACKOFF_MAX_MS = 2 * 60 * 60 * 1000;
 // deliberately deferred until the mechanism is confirmed from these logs.
 const STALE_SYNC_WARN_MS = 5 * 60 * 1000;
 
+// The fastest sync interval the settings UI offers (AdminPanel's 15s/30s/60s/2min selector)
+// and the floor connectAllForUser accepts from user preferences. Anything that must not
+// collide with a sync tick is defined against this.
+export const MIN_SYNC_INTERVAL_MS = 15 * 1000;
+
+// How long ImapFlow waits for a quiet connection before starting IDLE. Its own default is
+// 15000ms, which exactly equals MIN_SYNC_INTERVAL_MS — a tick every 15s cleared the arming
+// timer ~100ms before it could fire, so IDLE never started. Kept well below the minimum tick
+// so IDLE engages in every configuration, and above the sub-second gaps a single sync leaves
+// between its own commands so we don't inject IDLE/DONE round trips mid-sequence.
+export const AUTO_IDLE_DELAY_MS = 3000;
+
+// Consecutive health checks (90s apart) an IDLE-capable account may be observed NOT idling
+// before we warn. IDLE covers all but a moment of each cycle, so three straight misses means
+// push is not running and the account has silently degraded to polling.
+const IDLE_MISS_WARN_STREAK = 3;
+
 // How often to actively probe each connected account for a "deaf" sync connection —
 // one that still passes commands but has stopped reflecting new mail (the ~60-min
 // delay we observed). A fresh connection's UID SEARCH is authoritative; if the server
@@ -412,11 +447,11 @@ const BIDI_OVERRIDE_RE = new RegExp(
 );
 
 // Extract html/text/attachments from an already-fetched msg (no extra IMAP round-trip)
-function extractBodyFromMsg(msg) {
+export function extractBodyFromMsg(msg) {
   if (!msg.bodyStructure) return { html: null, text: null, attachments: [] };
   const results = { textParts: [], attachments: [] };
   walkStructure(msg.bodyStructure, results);
-  if (results.textParts.length === 0) {
+  if (results.textParts.length === 0 && bodyFallbackApplies(results)) {
     const rootType = (msg.bodyStructure.type || '').toLowerCase();
     results.textParts.push({
       part: msg.bodyStructure.part || '1',
@@ -593,11 +628,46 @@ function decodeAttachmentBuffer(buf, encoding) {
   return Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
 }
 
+// The single-part body fallback exists for a bare root whose type walkStructure
+// does not recognize. When the walk filed parts as attachments and found no
+// text, the message simply has no body (e.g. a DMARC report that is just an
+// application/zip, or a multipart/mixed holding only a file) — re-serving the
+// first part as text/plain rendered decoded binary as the message. A collected
+// text/calendar part is not an unrecognized root either: fetchMessageBody
+// renders it as an invite card, and promoting it here served raw VCALENDAR
+// source as the message text.
+export function bodyFallbackApplies(results) {
+  return !(results.attachments || []).length && !(results.calendarParts || []).length;
+}
+
 export function walkStructure(node, results) {
+  walkNode(node, results);
+  // A text part that carries a filename is an attached file (an .html report, a
+  // .txt log) when the message also has an unnamed text part serving as its
+  // body. Senders often mark such files inline or omit the disposition, so the
+  // disposition check alone absorbed them into the body candidates and they
+  // vanished from the attachment list. When every text part is named, leave
+  // them as body — some clients name their body parts.
+  const named = results.textParts.filter(p => p.filename);
+  if (!named.length || named.length === results.textParts.length) return;
+  results.textParts = results.textParts.filter(p => !p.filename);
+  for (const p of named) {
+    results.attachments.push({
+      part: p.part,
+      filename: p.filename,
+      type: p.rawType,
+      encoding: p.encoding || 'base64',
+      size: p.size,
+      disposition: p.disposition,
+    });
+  }
+}
+
+function walkNode(node, results) {
   if (!node) return;
   const type = (node.type || '').toLowerCase();
   if (node.childNodes && node.childNodes.length > 0) {
-    for (const child of node.childNodes) walkStructure(child, results);
+    for (const child of node.childNodes) walkNode(child, results);
     return;
   }
   const disposition = (node.disposition || '').toLowerCase();
@@ -618,21 +688,28 @@ export function walkStructure(node, results) {
       size: node.dispositionParameters?.size ? parseInt(node.dispositionParameters.size) : node.size || 0,
       disposition,
     });
-  } else if (type === 'text/html') {
+  } else if (type === 'text/html' || type === 'application/xhtml+xml' || type === 'text/plain') {
     results.textParts.push({
-      part: node.part || '1', type,
+      part: node.part || '1',
+      type: type === 'text/plain' ? 'text/plain' : 'text/html',
       encoding: node.encoding || '',
       charset: node.parameters?.charset || 'utf-8',
+      // A filename marks a possible attached file; walkStructure's post-pass
+      // decides once the whole tree is known.
+      ...(filename ? {
+        filename,
+        rawType: node.type || type,
+        size: node.dispositionParameters?.size ? parseInt(node.dispositionParameters.size) : node.size || 0,
+        disposition,
+      } : {}),
     });
-  } else if (type === 'application/xhtml+xml') {
-    results.textParts.push({
-      part: node.part || '1', type: 'text/html',
-      encoding: node.encoding || '',
-      charset: node.parameters?.charset || 'utf-8',
-    });
-  } else if (type === 'text/plain') {
-    results.textParts.push({
-      part: node.part || '1', type,
+  } else if (type === 'text/calendar') {
+    // Meeting invites (e.g. an Outlook forwarded meeting) can be the only
+    // body part — collected separately so fetchMessageBody can render a
+    // readable invite when no text/html or text/plain alternative exists.
+    results.calendarParts = results.calendarParts || [];
+    results.calendarParts.push({
+      part: node.part || '1',
       encoding: node.encoding || '',
       charset: node.parameters?.charset || 'utf-8',
     });
@@ -687,7 +764,13 @@ function safeDate(d) {
 // fetchBody:           store body_html/body_text during backfill/sync.
 //                      Disabled for providers that throttle BODY[] fetches at scale.
 // usesIdle:            keep the persistent sync connection in IMAP IDLE for push events.
-// maxSyncIntervalMs:   clamp the user's sync interval for providers whose IDLE is unreliable.
+// maxSyncIntervalMs:   CEILING on the tick value — Math.min, so it can only make the tick
+//                      FASTER. Intended for providers whose IDLE is unreliable and therefore
+//                      must not be left on a slow tick. NB: it cannot express "poll slowly
+//                      because IDLE handles delivery" — that needs a floor (Math.max), which
+//                      does not exist yet. PurelyMail's 120000 was added meaning the latter
+//                      (see #299) and so has never had any effect: every value the settings UI
+//                      offers is <= 120000, making Math.min a no-op for all of them.
 // pushesFlags:         server pushes flag changes via IDLE; false = poll every sync tick.
 // flagPollEveryTicks:  for non-push flag providers, poll flags every N successful sync ticks.
 // snippetIndex:        run the background snippet indexer after backfill.
@@ -773,7 +856,12 @@ const PROVIDERS = {
     preferFreshBodyFetch: true,
     freshInboxSync: false,          // IDLE push + backstop poll on the persistent connection replaces fresh-login-per-tick
     autoBackfillExistingOnConnect: false,
-    maxSyncIntervalMs: 120000,      // IDLE pushes new mail instantly; the periodic tick is now a light ~2-min backstop
+    // INERT — see the maxSyncIntervalMs note above. This was added to make the tick a light
+    // ~2-min backstop now that IDLE pushes mail, but the field is a Math.min ceiling, so on a
+    // 15s user interval it resolves to 15s and the backstop never happened. Left in place
+    // rather than silently changed: making it a floor would also stretch the flag poll
+    // (flagPollEveryTicks: 6) from 90s to 12 minutes, which is a product decision, not a bugfix.
+    maxSyncIntervalMs: 120000,
     flagPollEveryTicks: 6,
     prefetchNewBodies: true,
     prefetchNewBodiesLimit: 1, // warm only the newest arrival; avoids BODY[] bursts while
@@ -1053,15 +1141,17 @@ async function computeThreadId(accountId, messageId, inReplyTo, references, subj
 
 // Ensure OAuth token is fresh before connecting
 async function ensureFreshToken(account) {
-  if (account.oauth_provider !== 'microsoft') return account;
+  const refreshers = { microsoft: refreshMicrosoftToken, google: refreshGoogleToken };
+  const refresh = refreshers[account.oauth_provider];
+  if (!refresh) return account;
   if (!account.oauth_token_expiry) return account;
   const expiry = new Date(account.oauth_token_expiry);
   const now = new Date();
   // Refresh if token expires within 5 minutes
   if (expiry - now < 5 * 60 * 1000) {
-    console.log(`Refreshing Microsoft token for ${logAccount(account)}`);
+    console.log(`Refreshing ${account.oauth_provider} token for ${logAccount(account)}`);
     try {
-      account = await refreshMicrosoftToken(account);
+      account = await refresh(account);
     } catch (err) {
       console.error(`Token refresh failed for ${logAccount(account)}:`, err.message);
     }
@@ -1105,6 +1195,14 @@ export function makeClientCfg(account, resolved, { enableIdle = false, policy = 
   // Connection-sensitive providers (e.g. PurelyMail) need IDLE re-issued more often than the
   // 25-min default or the socket goes half-open ("deaf"); idleKeepaliveMs overrides it.
   if (enableIdle) cfg.maxIdleTime = idleKeepaliveMs || 25 * 60 * 1000;
+  // maxIdleTime governs how long an IDLE lasts once started; autoIdleDelay governs whether it
+  // starts at all. ImapFlow arms IDLE only after this much quiet, and its default is 15000ms —
+  // exactly the fastest sync interval the settings UI offers. On a 15s interval each tick left
+  // the connection quiet for ~14.9s, clearing the arming timer ~100ms before it fired, so IDLE
+  // never started on ANY account and every provider was silently reduced to polling. (Zoho was
+  // the only one to complain: it drops a non-IDLE session after ~295s, producing an endless
+  // reconnect loop.) MUST stay below MIN_SYNC_INTERVAL_MS — see the makeClientCfg tests.
+  if (enableIdle) cfg.autoIdleDelay = AUTO_IDLE_DELAY_MS;
   // OAuth2 XOAUTH2 for Gmail and Microsoft
   if ((account.oauth_provider === 'google' || account.oauth_provider === 'microsoft')
       && account.oauth_access_token) {
@@ -1377,6 +1475,9 @@ export class ImapManager {
     this.backfillRunning = new Set(); // `${accountId}:${folder}` — prevent duplicate folder backfills
     this.backfillAllRunning = new Set(); // accountId — prevent concurrent full backfill sequences
     this._bgConnSem = createKeyedSemaphore(BACKGROUND_CONN_MAX_PER_HOST); // cap concurrent background IMAP conns (backfill + snippet indexer) per provider host
+    // Serializes antispam auto-moves per account (keyed by account id) — see
+    // AUTO_MOVE_MAX_CONCURRENT_PER_ACCOUNT. Classification stays concurrent.
+    this._autoMoveSem = createKeyedSemaphore(AUTO_MOVE_MAX_CONCURRENT_PER_ACCOUNT);
     this._connectCooldown = new Map(); // accountId -> { until: ms, failures: number } after connection refusals
     // accountId -> the value last persisted to email_accounts.sync_error: a string (error is
     // showing), null (known clear), or absent (unknown — e.g. just after a restart, where the
@@ -1396,6 +1497,7 @@ export class ImapManager {
     this.userFolderSyncIntervalMs = new Map(); // userId -> folder-structure sync ms (0 = never)
     this.lastFolderSyncAt = new Map(); // accountId -> last folder-structure sync timestamp
     this._pollOnlyAccounts = new Set(); // accountId — demoted to poll-only (no persistent IDLE) by the per-host connection budget (#379)
+    this._idleMissStreak = new Map(); // accountId -> consecutive health checks seen NOT idling despite IDLE being enabled
     this.snippetIndexerRunning = new Set(); // accountId — prevent duplicate snippet-index runs
     this.snippetBackoff = new Map();        // imap_host -> { failures, until } circuit breaker (host-level: a per-host connection limit hits every account on that host, so back them all off together)
     this.lastUserActivity = new Map();      // accountId -> ms timestamp of last live body fetch
@@ -1421,7 +1523,9 @@ export class ImapManager {
     this._healthCheckTimer = setInterval(async () => {
       try {
         const result = await query(
-          "SELECT id, email_address FROM email_accounts WHERE enabled = true AND protocol = 'imap'"
+          // imap_host/oauth_provider are needed for providerProfile() in the IDLE-invariant
+          // check below; they are not credentials, so this stays a cheap non-secret query.
+          "SELECT id, email_address, imap_host, oauth_provider FROM email_accounts WHERE enabled = true AND protocol = 'imap'"
         );
         for (const row of result.rows) {
           // A poll-only account (per-host budget) holds no persistent connection by design; while
@@ -1451,6 +1555,26 @@ export class ImapManager {
             if (last && Date.now() - last > STALE_SYNC_WARN_MS) {
               const mins = Math.round((Date.now() - last) / 60000);
               console.warn(`Health check: ${logAccount(row)} connected but no successful sync in ${mins}m — possible stale connection`);
+            }
+            // Assert the IDLE invariant. An account configured for push that is never observed
+            // idling is silently degraded to polling: mail still arrives, so nothing else in the
+            // system notices, and the only visible symptom is provider-specific (Zoho drops a
+            // non-IDLE session after ~295s). This exact state ran unnoticed on every account
+            // until it was found by reading raw IMAP traffic; the check below makes it say so.
+            // Poll-only accounts hold no IDLE connection by design and are exempt.
+            const client = this.connections.get(row.id);
+            if (client && !this._pollOnlyAccounts.has(row.id) && providerProfile(row).usesIdle !== false) {
+              if (client.idling) {
+                this._idleMissStreak.delete(row.id);
+              } else {
+                const misses = (this._idleMissStreak.get(row.id) || 0) + 1;
+                this._idleMissStreak.set(row.id, misses);
+                // Warn once on crossing the threshold, not every cycle: the condition persists
+                // until reconnect, and a per-cycle warning would drown the log it belongs in.
+                if (misses === IDLE_MISS_WARN_STREAK) {
+                  console.warn(`Health check: ${logAccount(row)} has IDLE enabled but has not been idling for ${misses} consecutive checks — push is inactive, this account is polling only`);
+                }
+              }
             }
           }
         }
@@ -1784,7 +1908,11 @@ export class ImapManager {
         );
       }
       if (this.syncingAccounts.has(account.id)) return;
-      console.log(`IMAP IDLE: new mail for ${logAccount(account)} (${prevCount} → ${count})`);
+      // Named for the IMAP response that fired it, NOT for IDLE. An untagged EXISTS arrives
+      // during IDLE *or* as an unsolicited response to any polled command, so the old
+      // "IMAP IDLE:" prefix asserted push was working on connections that were only polling —
+      // which is precisely how a total absence of IDLE stayed invisible for months.
+      console.log(`IMAP EXISTS: new mail for ${logAccount(account)} (${prevCount} → ${count})`);
       this._syncTick(account).catch(err =>
         console.warn(`IDLE-triggered sync error for ${logAccount(account)}:`, err.message)
       );
@@ -1797,7 +1925,8 @@ export class ImapManager {
       if (existing) clearTimeout(existing);
       this._flagDebounceTimers.set(account.id, setTimeout(() => {
         this._flagDebounceTimers.delete(account.id);
-        console.log(`IMAP IDLE: flag change for ${logAccount(account)}, syncing flags`);
+        // As above: an unsolicited FETCH is not proof of IDLE. Name the response, not the mode.
+        console.log(`IMAP FETCH: flag change for ${logAccount(account)}, syncing flags`);
         this._syncFlagsForRange(account).catch(err =>
           console.warn(`Flag-triggered sync error for ${logAccount(account)}:`, err.message)
         );
@@ -1985,6 +2114,9 @@ export class ImapManager {
     this.syncThrottleSkips.delete(accountId);
     this.syncTickCount.delete(accountId);
     this.lastSyncOkAt.delete(accountId);
+    // The streak describes one client's IDLE state; a reconnect gets a fresh client and must
+    // start from zero, or a warning could carry over and fire against a healthy connection.
+    this._idleMissStreak.delete(accountId);
     // Drop the cached sync_error state (NOT the refusal cooldown, which deliberately survives a
     // disconnect) so a re-added account writes through instead of trusting a stale cache entry.
     this._syncErrorState.delete(accountId);
@@ -2816,6 +2948,59 @@ export class ImapManager {
   // noBodyParts: skip ALL body part fetches (uid/flags/envelope/bodyStructure only).
   // Used for the periodic sync interval so slow servers like purelymail.com don't time out
   // fetching 3+ body parts × 50 messages.  Snippets come from backfill or on-demand fetches.
+
+  /**
+   * v0.2 antispam: hand a freshly-inserted message to the classification
+   * pipeline. Fire-and-forget — the sync/backfill loop must never be blocked by
+   * a classifier failure, and only accounts with antispam_enabled take part
+   * (the pipeline re-checks the per-user master switch as well).
+   *
+   * Shared by BOTH ingest paths: syncMessages (new mail via IDLE/poll, with the
+   * body) and backfillMessages (initial population, manual reindex, UIDVALIDITY
+   * recovery — subject/attachment signals only, since the backfill may not have
+   * fetched bodies). Without the backfill call site a reindex-classified mailbox
+   * silently skipped classification entirely.
+   *
+   * The backfill passes `deferAutoMove`, so a reindex tags its whole history
+   * without moving any of it: hundreds of concurrent moves would compete for the
+   * 2 pooled connections (each overflow loser opening a fresh login). The verdict
+   * and the deferred intent are persisted; the move stays a property of normal
+   * ingest. PR review, 2026-09-15.
+   *
+   * @param {Object} account — the account row (needs id + antispam_enabled)
+   * @param {string} messageId — messages.id of the inserted row
+   * @param {Object} parsed — parsed message (parsedHeaders feed the auth gate)
+   * @param {Object} [opts]
+   *   @param {boolean} [opts.deferAutoMove=false] — tag only, never move (backfill)
+   */
+  maybeClassifyNewMessage(account, messageId, parsed, { deferAutoMove = false } = {}) {
+    if (!account?.antispam_enabled) return;
+    classifyAndTagMessage(messageId, {
+      headers: parsed?.parsedHeaders || [],
+      deferAutoMove,
+      imap: {
+        // Serialized per account (AUTO_MOVE_MAX_CONCURRENT_PER_ACCOUNT): the
+        // classification above keeps running concurrently, only the IMAP move is
+        // queued, so a burst of classified messages cannot fan out that many
+        // moves — and fresh overflow logins — at the provider.
+        moveMessage: async (acct, uid, fromFolder, toFolder) => {
+          const key = acct?.id || account.id;
+          await this._autoMoveSem.acquire(key, { timeoutMs: AUTO_MOVE_QUEUE_TIMEOUT_MS });
+          try {
+            return await this.moveMessage(acct, uid, fromFolder, toFolder);
+          } finally {
+            this._autoMoveSem.release(key);
+          }
+        },
+        broadcast: (...args) => this.broadcast(...args),
+        _guardMoveUid: (...args) => this._guardMoveUid(...args),
+        _unguardMoveUid: (...args) => this._unguardMoveUid(...args),
+      },
+    }).catch(err => {
+      console.warn(`spam auto-classification failed (msg ${messageId}):`, err.message);
+    });
+  }
+
   async syncMessages(account, client, folder = 'INBOX', limit = 50, prefetchBody = true, noBodyParts = false) {
     const provider = providerProfile(account);
 
@@ -2930,8 +3115,8 @@ export class ImapManager {
         // Inbox-ingest facts core hands to plugins after this batch (via the `inboxIngest` hook):
         //   • newInboxIds — the id of every row this sync newly inserts into INBOX, read or unread.
         //     Kept separate from `newMessages` (which is unread-only for notifications) because an
-        //     inbound reply already \Seen on another device must still let a plugin re-evaluate its
-        //     thread (e.g. clear a GTD Watch/Delegated label).
+        //     inbound message already \Seen on another device must still let a plugin re-evaluate
+        //     its thread according to the plugin's current policy.
         //   • ingestDeletedIds — only the ids the block-list / inbox rules genuinely DELETED
         //     (expunged / dropped) from INBOX, so a plugin can exclude them; a rule-MOVED reply is
         //     intentionally kept — its thread still needs re-evaluating even though it was filed
@@ -3082,6 +3267,7 @@ export class ImapManager {
               if (!parsed.isRead) {
                 newMessages.push({ ...parsed, id: result.rows[0].id, accountId: account.id, folder });
               }
+              this.maybeClassifyNewMessage(account, result.rows[0].id, parsed);
             }
             // Propagate resolved thread_id to any earlier messages that used this
             // message as a provisional thread root (out-of-order delivery / sync).
@@ -3252,9 +3438,9 @@ export class ImapManager {
             }
             // Any unread candidate no longer in `newMessages` was moved out of / deleted from
             // INBOX by the block-list or a rule. Only genuinely-DELETED ones are excluded from
-            // the ingest re-eval: a rule that merely MOVED an inbound reply (its row still lives,
-            // in another folder) must still let the plugin re-evaluate the thread so a self-reply's
-            // Watch/Delegated label clears. Distinguish the two by a single is_deleted probe over
+            // the ingest re-eval: a rule that merely MOVED an inbound message (its row still lives,
+            // in another folder) must still let the plugin re-evaluate the thread. Distinguish the
+            // two by a single is_deleted probe over
             // the removed ids — a moved row survives (is_deleted = false), a deleted one does not.
             if (unreadBeforeRules) {
               const survivingIds = new Set(newMessages.map(m => m.id));
@@ -3292,6 +3478,7 @@ export class ImapManager {
                 ? (latest.subject || '(no subject)')
                 : `${alertCount} new messages`,
               icon: '/icon-512.png',
+              badge: '/badge-96.png',
               // Deep-link the notification to the latest message (the notification's
               // tag collapses arrivals into one card representing `latest`). Guarded:
               // fall back to the inbox if the id is somehow absent.
@@ -3609,7 +3796,7 @@ export class ImapManager {
                   } catch { /* non-fatal */ }
                 }
 
-                await query(`
+                const bfInsert = await query(`
                   INSERT INTO messages (
                     account_id, uid, folder, message_id, subject,
                     from_name, from_email, to_addresses, cc_addresses,
@@ -3676,6 +3863,7 @@ export class ImapManager {
                       delivery_addresses = COALESCE(messages.delivery_addresses, EXCLUDED.delivery_addresses),
                       sender_name = COALESCE(EXCLUDED.sender_name, messages.sender_name),
                       sender_email = COALESCE(EXCLUDED.sender_email, messages.sender_email)
+                  RETURNING id, (xmax = 0) as is_new
                 `, [
                   account.id, parsed.uid, folder,
                   bfMsgId, sanitizeStr(parsed.subject),
@@ -3693,6 +3881,16 @@ export class ImapManager {
                   sanitizeStr(parsed.senderName), sanitizeStr(parsed.senderEmail),
                 ]);
                 backfilledRows++;
+                // v0.2 antispam: classify genuinely-new rows — the same hook the
+                // sync path uses, so a manual reindex (or the initial population
+                // of a mailbox that just enabled antispam) is classified too.
+                // The backfill may not have fetched the body, in which case the
+                // classifier works from the subject/flag signals it does have.
+                // deferAutoMove: a reindex classifies the WHOLE mailbox at once,
+                // so moving is left to normal ingest — see maybeClassifyNewMessage.
+                if (bfInsert?.rows[0]?.is_new) {
+                  this.maybeClassifyNewMessage(account, bfInsert.rows[0].id, parsed, { deferAutoMove: true });
+                }
                 if (bfThreadId && bfThreadId !== bfMsgId) {
                   await query(
                     `UPDATE messages SET thread_id = $1
@@ -4502,11 +4700,11 @@ export class ImapManager {
           throw new Error('Command failed');
         }
 
-        const results = { textParts: [], attachments: [], inlineImages: [] };
+        const results = { textParts: [], attachments: [], inlineImages: [], calendarParts: [] };
         walkStructure(structure, results);
 
         // Handle single-part root node (no childNodes, type is the content type)
-        if (results.textParts.length === 0) {
+        if (results.textParts.length === 0 && bodyFallbackApplies(results)) {
           const rootType = (structure.type || '').toLowerCase();
           results.textParts.push({
             part: structure.part || '1',
@@ -4518,11 +4716,16 @@ export class ImapManager {
 
         attachments = results.attachments;
 
+        // Calendar parts are only fetched when the message has no ordinary body —
+        // a multipart/alternative invite keeps its normal text/html rendering.
+        const calendarParts = results.textParts.length === 0 ? results.calendarParts : [];
+
         // Fetch any text/image parts not already obtained from the speculative fetch
         const inlineImages = results.inlineImages || [];
         const needed = [
           ...new Set([
             ...results.textParts.map(p => p.part),
+            ...calendarParts.map(p => p.part),
             ...inlineImages.map(p => p.part),
           ])
         ].filter(p => !prefetched.has(p));
@@ -4576,6 +4779,21 @@ export class ImapManager {
           const decoded = decodeBody(buf, part.encoding, part.charset);
           if (part.type === 'text/html' && !html) html = decoded;
           else if (part.type === 'text/plain' && !text) text = decoded;
+        }
+
+        // Calendar-only message (e.g. an Outlook forwarded meeting request):
+        // render a readable invite card instead of raw VCALENDAR source. The
+        // html rides the normal sanitizer path like any email HTML. Calendar
+        // data with no renderable VEVENT is shown raw rather than as nothing.
+        if (!html && !text && calendarParts.length) {
+          for (const part of calendarParts) {
+            const buf = prefetched.get(part.part);
+            if (!buf) continue;
+            const decoded = decodeBody(buf, part.encoding, part.charset);
+            const invite = renderCalendarInvite(decoded);
+            if (invite) { html = invite.html; text = invite.text; break; }
+            if (!text) text = decoded;
+          }
         }
 
         // Step 3: replace cid: references in HTML with data: URIs so inline
@@ -4786,12 +5004,6 @@ export class ImapManager {
     }
     console.error(`setFlag failed after retry: uid=${uid} ${flag}=${value}:`, lastErr?.message);
     throw lastErr;
-  }
-
-  async createFolder(account, path) {
-    return withFreshClient(account, async (client) => {
-      await client.mailboxCreate(path);
-    });
   }
 
   // Ensure a mailbox exists, returning { path, created }: `path` is the real server path
@@ -5613,7 +5825,10 @@ export class ImapManager {
       const prefResult = await query('SELECT preferences FROM users WHERE id = $1', [userId]);
       const prefs = prefResult.rows[0]?.preferences || {};
       const sec = parseInt(prefs.syncInterval);
-      if (sec >= 15 && sec <= 120) {
+      // Bounded by MIN_SYNC_INTERVAL_MS rather than a bare 15 so the floor stays tied to the
+      // constant AUTO_IDLE_DELAY_MS is checked against — raising one without the other is what
+      // would silently disable IDLE again.
+      if (sec * 1000 >= MIN_SYNC_INTERVAL_MS && sec <= 120) {
         this.userSyncIntervalMs.set(userId, sec * 1000);
       }
       const folderSec = parseInt(prefs.folderSyncInterval);
